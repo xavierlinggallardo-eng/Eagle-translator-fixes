@@ -2795,25 +2795,116 @@ def fill_sdk_tl_directory_v2(
 
 
 def fill_sdk_tl_directory(sdk_tl_dir: str, entries: List[Entry],
-                          lang: str = '', backup: bool = True,
-                          **kwargs) -> Tuple[int, int]:
-    """Backwards-compatible wrapper around :func:`fill_sdk_tl_directory_v2`.
+                          lang: str = '', backup: bool = True) -> Tuple[int, int]:
+    """Write translations directly into SDK-generated `tl/<lang>/<file>.rpy`.
 
-    Returns the old ``(files_modified, lines_written)`` tuple so existing
-    UI code keeps working unchanged.  Accepts every extra keyword the v2
-    function supports — e.g.
+    This is the ROCK-SOLID production path: sequential, simple, preserves the
+    real Ren'Py block IDs, doesn't export anything extra, and matches the
+    behaviour the GUI has relied on since v2.x.
 
-        fill_sdk_tl_directory(tl_dir, entries, workers=8,
-                              progress_cb=cb, strict_placeholders=True)
+    Uses ``entry.line_idx`` (the exact position of the empty `""` line) so
+    IDs, suffixes and indentation are kept verbatim.  Creates a one-time
+    ``.bak`` next to each modified file when ``backup=True``.
+
+    Writes EVERY translated entry — no skip_unchanged filter, no atomic
+    rename, no parallel I/O.  If you want those features, call
+    :func:`fill_sdk_tl_directory_v2` explicitly.
+
+    Returns ``(files_modified, lines_written)``.
     """
-    # Sensible defaults for the legacy entry point.
-    kwargs.setdefault('workers', 4)
-    kwargs.setdefault('skip_unchanged', True)
-    kwargs.setdefault('atomic', True)
-    result = fill_sdk_tl_directory_v2(
-        sdk_tl_dir, entries, lang=lang, backup=backup, **kwargs,
-    )
-    return (result.files_modified, result.lines_written)
+    by_file: Dict[str, List[Entry]] = defaultdict(list)
+    for e in entries:
+        if e.kind not in _FILLABLE_KINDS:
+            continue
+        if e.translation and e.translation.strip():
+            by_file[e.file].append(e)
+
+    files_modified = 0
+    lines_written = 0
+
+    for rel_path, file_entries in by_file.items():
+        # Resolve path — same multi-strategy fallback as v2.x.
+        full = os.path.join(sdk_tl_dir, rel_path)
+        if not os.path.isfile(full):
+            full = os.path.join(sdk_tl_dir, os.path.basename(rel_path))
+        if not os.path.isfile(full):
+            basename = os.path.basename(rel_path)
+            found: Optional[str] = None
+            for dp, _dirs, fns in os.walk(sdk_tl_dir):
+                if basename in fns:
+                    candidate = os.path.join(dp, basename)
+                    try:
+                        with open(candidate, 'r', encoding='utf-8', errors='replace') as cf:
+                            first = cf.read(2000)
+                    except Exception:
+                        continue
+                    if 'translate ' in first or 'old "' in first:
+                        found = candidate
+                        break
+            if found:
+                full = found
+        if not os.path.isfile(full):
+            log.warning('fill_sdk: file not found: %s', rel_path)
+            continue
+
+        try:
+            with open(full, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+        except Exception as ex:
+            log.error('fill_sdk read %s: %s', full, ex)
+            continue
+
+        modified = False
+        for e in file_entries:
+            idx = e.line_idx
+            if idx < 0 or idx >= len(lines):
+                continue
+            original_line = lines[idx]
+            escaped = _escape(e.translation)
+
+            # `translate <lang> strings:` entry — fill the `new ""` line.
+            if e.kind == 'string' or e.active_label == 'new':
+                mn = re.match(r'^(\s*)new ""\s*$', original_line)
+                if mn:
+                    lines[idx] = f'{mn.group(1)}new "{escaped}"\n'
+                    lines_written += 1
+                    modified = True
+                continue
+
+            # Dialogue / say entry — fill the empty `mc ""` line.
+            # Speaker may be a bare word ("mc") or a quoted string (`"???"`).
+            me = re.match(
+                r'^(\s*)(?:("(?:[^"\\]|\\.)*"|\w+)\s+)?""\s*(with\s+\S+)?\s*$',
+                original_line,
+            )
+            if not me:
+                continue
+            line_indent = me.group(1)
+            line_speaker = me.group(2) or e.speaker
+            line_suffix = (' ' + me.group(3)) if me.group(3) else (e.active_label or '')
+            if line_speaker and line_speaker not in ('new', 'old'):
+                lines[idx] = f'{line_indent}{line_speaker} "{escaped}"{line_suffix}\n'
+            else:
+                lines[idx] = f'{line_indent}"{escaped}"{line_suffix}\n'
+            lines_written += 1
+            modified = True
+
+        if modified:
+            if backup:
+                bak = full + '.bak'
+                if not os.path.exists(bak):
+                    try:
+                        shutil.copy2(full, bak)
+                    except Exception as ex:
+                        log.warning('fill_sdk backup %s: %s', full, ex)
+            try:
+                with open(full, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                files_modified += 1
+            except Exception as ex:
+                log.error('fill_sdk write %s: %s', full, ex)
+
+    return (files_modified, lines_written)
 
 
 def apply_strings_map(entries: List[Entry], strings_map: Dict[str, str]) -> int:
@@ -2889,15 +2980,18 @@ def _detect_lang_from_dir(sdk_tl_dir: str) -> str:
 def scan_sdk_tl_directory(sdk_tl_dir: str, lang: str = '',
                           strings_json_path: str = '',
                           *,
-                          workers: int = 4,
+                          workers: int = 1,
                           progress_cb: Optional[Callable[[int, int, str], None]] = None,
                           ) -> List[Entry]:
     """Scan an SDK-generated ``tl/<lang>/`` and return entries needing translation.
 
     Auto-detects the language if ``lang`` is empty or doesn't match the files,
-    pre-fills entries from any nearby ``strings.json``, and parses files in
-    parallel (``workers``) so AVN projects with hundreds of .rpy files load
-    in seconds instead of minutes.
+    and pre-fills entries from any nearby ``strings.json``.
+
+    By default scanning is sequential (``workers=1``) to match the historical
+    behaviour exactly.  Pass ``workers=4`` (or higher) for a parallel scan on
+    big projects — the entries returned are functionally identical, only the
+    order may differ.
     """
     detected_lang = lang or _detect_lang_from_dir(sdk_tl_dir)
     if detected_lang != lang:
