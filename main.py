@@ -5,9 +5,9 @@ Toda la lógica de escaneo / traducción / exportación se conserva intacta
 y usa renpy_parser.py + translator_engines.py (sin modificarlos).
 """
 from __future__ import annotations
-import os, sys, json, traceback, time
+import os, sys, json, traceback, time, re, subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Callable
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QSize
 from PyQt6.QtGui import (
@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QProgressBar,
     QTabWidget, QFileDialog, QPlainTextEdit, QListWidget, QListWidgetItem,
     QMessageBox, QSpinBox, QSlider, QFrame, QSizePolicy, QGraphicsDropShadowEffect,
-    QStackedWidget,
+    QStackedWidget, QDialog,
 )
 
 from renpy_parser import (
@@ -285,6 +285,7 @@ def load_config() -> dict:
         "selector_position": "bottom_right",
         "source_lang": "auto",
         "target_lang": "ES-419",
+        "renpy_sdk_path": r"C:\renpy-8.5.2-sdk",
     }
 
 def save_config(cfg: dict):
@@ -292,6 +293,320 @@ def save_config(cfg: dict):
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
     except Exception as e:
         print("config save err:", e)
+
+# ---------------------------------------------------------------------------
+# SDK Ren'Py integration
+# ---------------------------------------------------------------------------
+def _find_renpy_executable(sdk_path: str) -> Optional[str]:
+    """Localiza renpy.exe (Windows) o renpy.sh (Linux/Mac) dentro del SDK."""
+    if not sdk_path or not os.path.isdir(sdk_path):
+        return None
+    candidates = [
+        os.path.join(sdk_path, 'renpy.exe'),
+        os.path.join(sdk_path, 'renpy.sh'),
+        os.path.join(sdk_path, 'renpy'),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+class SDKTranslateWorker(QThread):
+    """Ejecuta `renpy.exe <project_dir> translate <lang>` y emite el stdout
+    línea a línea como log streaming."""
+    log = pyqtSignal(str)
+    finished_ok = pyqtSignal(str)   # tl_dir generado
+    failed = pyqtSignal(str)
+
+    def __init__(self, sdk_path: str, project_dir: str, tl_name: str, parent=None):
+        super().__init__(parent)
+        self.sdk_path = sdk_path
+        self.project_dir = project_dir
+        self.tl_name = tl_name
+        self._proc: Optional[subprocess.Popen] = None
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+        p = self._proc
+        if p is not None:
+            try: p.terminate()
+            except Exception: pass
+
+    def run(self):
+        try:
+            exe = _find_renpy_executable(self.sdk_path)
+            if not exe:
+                self.failed.emit(
+                    f"No se encontró renpy.exe/renpy.sh en el SDK:\n{self.sdk_path}")
+                return
+
+            cmd = [exe, self.project_dir, 'translate', self.tl_name]
+            self.log.emit(f"→ Lanzando SDK: {' '.join(cmd)}")
+
+            kwargs = dict(
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                universal_newlines=True,
+                encoding='utf-8',
+                errors='replace',
+            )
+            if os.name == 'nt':
+                kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+            self._proc = subprocess.Popen(cmd, **kwargs)
+            assert self._proc.stdout is not None
+            for line in self._proc.stdout:
+                if self._stop:
+                    try: self._proc.terminate()
+                    except Exception: pass
+                    break
+                self.log.emit(line.rstrip())
+            rc = self._proc.wait()
+
+            if self._stop:
+                self.failed.emit("Generación cancelada por el usuario.")
+                return
+            if rc != 0:
+                self.failed.emit(f"renpy.exe terminó con código {rc}.")
+                return
+
+            tl_dir = os.path.join(self.project_dir, 'game', 'tl', self.tl_name)
+            if not os.path.isdir(tl_dir):
+                self.failed.emit(
+                    f"El SDK terminó pero no se generó la carpeta esperada:\n{tl_dir}")
+                return
+            self.finished_ok.emit(tl_dir)
+        except Exception as ex:
+            self.failed.emit(f"{ex}\n{traceback.format_exc()}")
+
+
+class SDKProgressDialog(QDialog):
+    """Diálogo modal con log en streaming para acompañar al SDKTranslateWorker."""
+    def __init__(self, parent=None, title: str = "Generando traducción con el SDK de Ren'Py"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.resize(720, 420)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 18, 18, 18); v.setSpacing(10)
+
+        self.label = QLabel("Ejecutando renpy.exe translate ...")
+        self.label.setObjectName("Section")
+        v.addWidget(self.label)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        f = QFont("Consolas, Menlo, monospace"); f.setStyleHint(QFont.StyleHint.Monospace)
+        self.log_view.setFont(f)
+        v.addWidget(self.log_view, 1)
+
+        h = QHBoxLayout()
+        h.addStretch(1)
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_cancel.clicked.connect(self._on_cancel)
+        self.btn_close = QPushButton("Cerrar"); self.btn_close.setObjectName("primary")
+        self.btn_close.setEnabled(False)
+        self.btn_close.clicked.connect(self.accept)
+        h.addWidget(self.btn_cancel); h.addWidget(self.btn_close)
+        v.addLayout(h)
+
+        self._worker: Optional[SDKTranslateWorker] = None
+        self._success = False
+        self._tl_dir: Optional[str] = None
+
+    def attach(self, worker: SDKTranslateWorker):
+        self._worker = worker
+        worker.log.connect(self.append_log)
+        worker.finished_ok.connect(self._on_finished)
+        worker.failed.connect(self._on_failed)
+
+    def append_log(self, line: str):
+        self.log_view.appendPlainText(line)
+        sb = self.log_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_cancel(self):
+        if self._worker is not None and self._worker.isRunning():
+            self.append_log("\n⏹  Cancelando…")
+            self._worker.stop()
+        else:
+            self.reject()
+
+    def _on_finished(self, tl_dir: str):
+        self._success = True
+        self._tl_dir = tl_dir
+        self.append_log(f"\n✔ Carpeta tl generada: {tl_dir}")
+        self.btn_cancel.setEnabled(False)
+        self.btn_close.setEnabled(True)
+
+    def _on_failed(self, err: str):
+        self._success = False
+        self.append_log(f"\n✘ Error: {err}")
+        self.btn_cancel.setEnabled(False)
+        self.btn_close.setEnabled(True)
+
+    def result_tl_dir(self) -> Optional[str]:
+        return self._tl_dir if self._success else None
+
+
+# ---- Limpieza de archivos generados por el SDK -----------------------------
+_RE_SDK_TR_BLOCK   = re.compile(r'^(\s*)translate\s+(\S+)\s+(\S+)\s*:\s*$')
+_RE_SDK_TR_STRINGS = re.compile(r'^(\s*)translate\s+(\S+)\s+strings\s*:\s*$')
+_RE_SDK_NEW        = re.compile(r'^(\s+)new\s+"((?:[^"\\]|\\.)*)"\s*$')
+_RE_SDK_DLG        = re.compile(
+    r'^(\s+)((?:"(?:[^"\\]|\\.)*"|\w+)\s+)?"((?:[^"\\]|\\.)*)"(\s*(?:with\s+\S+)?)\s*$'
+)
+
+
+def _empty_sdk_tl_files(tl_dir: str, log_cb: Optional[Callable[[str], None]] = None):
+    """Tras la generación por el SDK, deja vacías las líneas con texto traducible
+    para que el escáner del traductor las detecte como pendientes."""
+    if log_cb is None:
+        log_cb = lambda _m: None
+
+    n_files = 0; n_lines = 0
+    for dirpath, _dirs, files in os.walk(tl_dir):
+        for fn in files:
+            if not fn.endswith('.rpy'):
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                with open(full, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.readlines()
+            except Exception as e:
+                log_cb(f"[empty_sdk] no se pudo leer {full}: {e}")
+                continue
+
+            modified = False
+            in_block = False
+            in_strings = False
+            block_indent = ''
+            saw_comment = False
+
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+
+                ms = _RE_SDK_TR_STRINGS.match(line)
+                if ms:
+                    in_strings = True; in_block = False
+                    block_indent = ms.group(1)
+                    i += 1; continue
+
+                mb = _RE_SDK_TR_BLOCK.match(line)
+                if mb and mb.group(3) != 'strings':
+                    in_strings = False
+                    in_block = True
+                    block_indent = mb.group(1)
+                    saw_comment = False
+                    i += 1; continue
+
+                stripped = line.strip()
+                if (in_block or in_strings) and stripped and not stripped.startswith('#'):
+                    cur_ind = len(line) - len(line.lstrip())
+                    if cur_ind <= len(block_indent):
+                        in_block = False
+                        in_strings = False
+
+                if in_strings:
+                    mn = _RE_SDK_NEW.match(line)
+                    if mn and mn.group(2) != '':
+                        lines[i] = f'{mn.group(1)}new ""\n'
+                        modified = True; n_lines += 1
+                elif in_block:
+                    if stripped.startswith('#'):
+                        saw_comment = True
+                    elif saw_comment:
+                        md = _RE_SDK_DLG.match(line)
+                        if md and md.group(3) != '':
+                            indent = md.group(1)
+                            speaker = md.group(2) or ''
+                            suffix = md.group(4) or ''
+                            new_line = f'{indent}{speaker}""{suffix}\n'
+                            if line != new_line:
+                                lines[i] = new_line
+                                modified = True; n_lines += 1
+                            saw_comment = False
+                            in_block = False
+
+                i += 1
+
+            if modified:
+                try:
+                    with open(full, 'w', encoding='utf-8') as f:
+                        f.writelines(lines)
+                    n_files += 1
+                except Exception as e:
+                    log_cb(f"[empty_sdk] no se pudo escribir {full}: {e}")
+
+    log_cb(f"🧹 Limpieza tl/: {n_files} archivos modificados, {n_lines} líneas vaciadas.")
+    return n_files, n_lines
+
+
+def ensure_tl_dir_with_sdk(parent, game_dir: str, tl_name: str, sdk_path: str,
+                           log_cb: Optional[Callable[[str], None]] = None
+                           ) -> Optional[str]:
+    """Si tl/<tl_name>/ no existe, pregunta al usuario si quiere generarlo con
+    el SDK. Si acepta, lanza el SDKTranslateWorker (con SDKProgressDialog) y
+    deja los archivos resultantes con las líneas traducibles vacías para que
+    el escáner los detecte. Devuelve la ruta tl/<tl_name>/ generada o None
+    si el usuario rechazó o la generación falló (en cuyo caso el caller
+    deberá hacer fallback a un QFileDialog)."""
+    tl_dir = os.path.join(game_dir, 'tl', tl_name)
+    if os.path.isdir(tl_dir):
+        return tl_dir
+
+    msg = QMessageBox(parent)
+    msg.setIcon(QMessageBox.Icon.Question)
+    msg.setWindowTitle(APP_NAME)
+    msg.setText(
+        f"No se encontraron archivos de traducción en:\n{tl_dir}\n\n"
+        f"¿Deseas generarlos automáticamente con el SDK de Ren'Py?\n\n"
+        f"Esto ejecutará renpy.exe translate y puede tardar 1-2 minutos."
+    )
+    msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+    if msg.exec() != QMessageBox.StandardButton.Yes:
+        return None
+
+    if not _find_renpy_executable(sdk_path):
+        QMessageBox.warning(parent, APP_NAME,
+            f"No se encontró renpy.exe/renpy.sh en el SDK configurado:\n"
+            f"{sdk_path or '(vacío)'}\n\n"
+            f"Configura la ruta correcta en Ajustes → Ruta del SDK de Ren'Py.")
+        return None
+
+    project_dir = os.path.dirname(os.path.normpath(game_dir))
+    if not project_dir or not os.path.isdir(project_dir):
+        QMessageBox.warning(parent, APP_NAME,
+            f"No se pudo determinar la carpeta raíz del proyecto a partir de:\n{game_dir}")
+        return None
+
+    dlg = SDKProgressDialog(parent)
+    worker = SDKTranslateWorker(sdk_path, project_dir, tl_name)
+    dlg.attach(worker)
+    if log_cb is not None:
+        worker.log.connect(log_cb)
+    worker.start()
+    dlg.exec()
+    worker.wait()
+
+    result_dir = dlg.result_tl_dir()
+    if not result_dir or not os.path.isdir(result_dir):
+        return None
+
+    try:
+        _empty_sdk_tl_files(result_dir, log_cb=log_cb)
+    except Exception as e:
+        if log_cb is not None:
+            log_cb(f"[ensure_tl_dir_with_sdk] error limpiando: {e}")
+
+    return result_dir
+
 
 # ---------------------------------------------------------------------------
 # Worker
@@ -632,10 +947,16 @@ class TraduccionTab(QWidget):
                     tl_lang = self.main.config.get("tl_name", "spanish_latino")
                     sdk_dir = os.path.join(gd, 'tl', tl_lang)
                     if not os.path.isdir(sdk_dir):
-                        sdk_dir = QFileDialog.getExistingDirectory(
-                            self, f"Selecciona la carpeta tl/{tl_lang}/ generada por el SDK",
-                            os.path.join(gd, 'tl'))
-                        if not sdk_dir: self.status.setText("Cancelado."); return
+                        sdk_path = self.main.config.get("renpy_sdk_path", "")
+                        generated = ensure_tl_dir_with_sdk(
+                            self, gd, tl_lang, sdk_path, log_cb=self.main.log)
+                        if generated and os.path.isdir(generated):
+                            sdk_dir = generated
+                        else:
+                            sdk_dir = QFileDialog.getExistingDirectory(
+                                self, f"Selecciona la carpeta tl/{tl_lang}/ generada por el SDK",
+                                os.path.join(gd, 'tl'))
+                            if not sdk_dir: self.status.setText("Cancelado."); return
                     sdk_entries = scan_sdk_tl_directory(sdk_dir, lang='')
                     entries = list(sdk_entries)
                     try:
@@ -1054,22 +1375,41 @@ class AjustesTab(QWidget):
         self.cb_phone_prio.setChecked(cfg.get("phone_priority", True))
         lay.addWidget(self.cb_phone_prio, 5, 0, 1, 2)
 
+        lay.addWidget(QLabel("Ruta del SDK de Ren'Py", objectName="Section"), 6, 0)
+        sdk_row = QHBoxLayout(); sdk_row.setContentsMargins(0, 0, 0, 0); sdk_row.setSpacing(8)
+        self.renpy_sdk_path = QLineEdit(cfg.get("renpy_sdk_path", r"C:\renpy-8.5.2-sdk"))
+        self.renpy_sdk_path.setPlaceholderText(r"C:\renpy-8.5.2-sdk")
+        b_browse_sdk = QPushButton("…"); b_browse_sdk.setObjectName("ghost")
+        b_browse_sdk.setFixedWidth(36)
+        b_browse_sdk.clicked.connect(self._browse_sdk)
+        sdk_row.addWidget(self.renpy_sdk_path, 1); sdk_row.addWidget(b_browse_sdk)
+        sdk_wrap = QWidget(); sdk_wrap.setLayout(sdk_row)
+        lay.addWidget(sdk_wrap, 6, 1)
+
         tips = QLabel(
             "Tips de velocidad\n"
             "• Google Translate gratis = más rápido y estable.\n"
             "• DeepLX público puede limitar; uno propio (Vercel/Railway) es ideal.\n"
             "• 16 hilos es buen balance. Sube a 24-32 con DeepLX propio.\n"
-            "• La caché en disco evita retraducir frases repetidas.")
+            "• La caché en disco evita retraducir frases repetidas.\n"
+            "• El SDK de Ren'Py se usa para generar tl/<idioma>/ automáticamente "
+            "cuando no existe (modo Fill SDK).")
         tips.setObjectName("Small"); tips.setWordWrap(True)
-        lay.addWidget(tips, 6, 0, 1, 2)
+        lay.addWidget(tips, 7, 0, 1, 2)
 
         btns = QHBoxLayout()
         b_save = QPushButton("Guardar"); b_save.setObjectName("primary"); b_save.setMinimumHeight(40)
         b_save.clicked.connect(self.save)
         b_reset = QPushButton("Restaurar"); b_reset.clicked.connect(self.reset)
         btns.addWidget(b_save); btns.addWidget(b_reset); btns.addStretch()
-        w = QWidget(); w.setLayout(btns); lay.addWidget(w, 7, 0, 1, 2)
-        lay.setRowStretch(8, 1)
+        w = QWidget(); w.setLayout(btns); lay.addWidget(w, 8, 0, 1, 2)
+        lay.setRowStretch(9, 1)
+
+    def _browse_sdk(self):
+        d = QFileDialog.getExistingDirectory(self, "Selecciona la carpeta del SDK de Ren'Py",
+                                             self.renpy_sdk_path.text().strip() or "")
+        if d:
+            self.renpy_sdk_path.setText(d)
 
     def save(self):
         cfg = self.main.config
@@ -1079,6 +1419,7 @@ class AjustesTab(QWidget):
         cfg["fallback_google"] = self.cb_fallback.isChecked()
         cfg["phone_priority"] = self.cb_phone_prio.isChecked()
         cfg["workers"] = int(self.workers.value())
+        cfg["renpy_sdk_path"] = self.renpy_sdk_path.text().strip() or r"C:\renpy-8.5.2-sdk"
         save_config(cfg)
         QMessageBox.information(self, APP_NAME, "Configuración guardada.")
 
@@ -1092,6 +1433,7 @@ class AjustesTab(QWidget):
         self.workers.setValue(int(c["workers"]))
         self.cb_fallback.setChecked(c["fallback_google"])
         self.cb_phone_prio.setChecked(c["phone_priority"])
+        self.renpy_sdk_path.setText(c.get("renpy_sdk_path", r"C:\renpy-8.5.2-sdk"))
         QMessageBox.information(self, APP_NAME, "Configuración restaurada.")
 
 
