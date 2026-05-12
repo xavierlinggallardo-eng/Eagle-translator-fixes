@@ -268,12 +268,9 @@ LANGS = [
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
-        except Exception:
-            pass
+DEFAULT_RENPY_SDK_PATH = r"C:\renpy-8.5.2-sdk"
+
+def _default_config() -> dict:
     return {
         "deeplx_endpoint": DEFAULT_DEEPLX,
         "engine": "google",
@@ -285,8 +282,21 @@ def load_config() -> dict:
         "selector_position": "bottom_right",
         "source_lang": "auto",
         "target_lang": "ES-419",
-        "renpy_sdk_path": r"C:\renpy-8.5.2-sdk",
+        "renpy_sdk_path": DEFAULT_RENPY_SDK_PATH,
     }
+
+def load_config() -> dict:
+    cfg = _default_config()
+    if CONFIG_PATH.exists():
+        try:
+            loaded = json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
+        except Exception:
+            pass
+    if not cfg.get("renpy_sdk_path"):
+        cfg["renpy_sdk_path"] = DEFAULT_RENPY_SDK_PATH
+    return cfg
 
 def save_config(cfg: dict):
     try:
@@ -298,17 +308,70 @@ def save_config(cfg: dict):
 # SDK Ren'Py integration
 # ---------------------------------------------------------------------------
 def _find_renpy_executable(sdk_path: str) -> Optional[str]:
-    """Localiza renpy.exe (Windows) o renpy.sh (Linux/Mac) dentro del SDK."""
-    if not sdk_path or not os.path.isdir(sdk_path):
+    """Localiza el ejecutable de Ren'Py dentro de la carpeta del SDK.
+
+    Acepta que el usuario apunte:
+      - a la raíz del SDK (donde está renpy.exe / renpy.sh)
+      - directamente al renpy.exe / renpy.sh
+      - a un subdirectorio cercano (busca 2 niveles abajo)
+    """
+    if not sdk_path:
         return None
-    candidates = [
-        os.path.join(sdk_path, 'renpy.exe'),
-        os.path.join(sdk_path, 'renpy.sh'),
-        os.path.join(sdk_path, 'renpy'),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
+    sdk_path = os.path.expandvars(os.path.expanduser(sdk_path)).strip()
+    sdk_path = sdk_path.strip('"').strip("'")
+    if not sdk_path:
+        return None
+
+    # Si apunta directamente al ejecutable
+    if os.path.isfile(sdk_path):
+        name = os.path.basename(sdk_path).lower()
+        if name in ('renpy.exe', 'renpy.sh', 'renpy'):
+            return sdk_path
+
+    if not os.path.isdir(sdk_path):
+        return None
+
+    names = ('renpy.exe', 'Renpy.exe', 'RenPy.exe', 'renpy.sh', 'renpy')
+
+    # 1) raíz
+    for n in names:
+        p = os.path.join(sdk_path, n)
+        if os.path.isfile(p):
+            return p
+
+    # 2) un nivel abajo (típico cuando el usuario apunta a una carpeta contenedora)
+    try:
+        for sub in os.listdir(sdk_path):
+            full_sub = os.path.join(sdk_path, sub)
+            if not os.path.isdir(full_sub):
+                continue
+            for n in names:
+                p = os.path.join(full_sub, n)
+                if os.path.isfile(p):
+                    return p
+    except OSError:
+        pass
+
+    # 3) dos niveles abajo (por si está en lib/ o similar)
+    try:
+        for sub in os.listdir(sdk_path):
+            full_sub = os.path.join(sdk_path, sub)
+            if not os.path.isdir(full_sub):
+                continue
+            try:
+                for sub2 in os.listdir(full_sub):
+                    full_sub2 = os.path.join(full_sub, sub2)
+                    if not os.path.isdir(full_sub2):
+                        continue
+                    for n in names:
+                        p = os.path.join(full_sub2, n)
+                        if os.path.isfile(p):
+                            return p
+            except OSError:
+                continue
+    except OSError:
+        pass
+
     return None
 
 
@@ -573,12 +636,25 @@ def ensure_tl_dir_with_sdk(parent, game_dir: str, tl_name: str, sdk_path: str,
     if msg.exec() != QMessageBox.StandardButton.Yes:
         return None
 
-    if not _find_renpy_executable(sdk_path):
-        QMessageBox.warning(parent, APP_NAME,
-            f"No se encontró renpy.exe/renpy.sh en el SDK configurado:\n"
-            f"{sdk_path or '(vacío)'}\n\n"
-            f"Configura la ruta correcta en Ajustes → Ruta del SDK de Ren'Py.")
-        return None
+    resolved_sdk_path = sdk_path
+    if not resolved_sdk_path:
+        resolved_sdk_path = DEFAULT_RENPY_SDK_PATH
+    if not _find_renpy_executable(resolved_sdk_path):
+        new_path, ok = QFileDialog.getOpenFileName(
+            parent,
+            "Selecciona renpy.exe (o renpy.sh) del SDK de Ren'Py",
+            resolved_sdk_path if os.path.isdir(resolved_sdk_path) else "",
+            "Ren'Py launcher (renpy.exe renpy.sh renpy);;Todos los archivos (*)")
+        if not new_path:
+            QMessageBox.warning(parent, APP_NAME,
+                f"No se encontró renpy.exe/renpy.sh en el SDK configurado:\n"
+                f"{resolved_sdk_path or '(vacío)'}\n\n"
+                f"Configura la ruta correcta en Ajustes → Ruta del SDK de Ren'Py.")
+            return None
+        resolved_sdk_path = new_path
+        sdk_path = new_path
+        if log_cb is not None:
+            log_cb(f"[SDK] usando ejecutable seleccionado: {new_path}")
 
     project_dir = os.path.dirname(os.path.normpath(game_dir))
     if not project_dir or not os.path.isdir(project_dir):
@@ -947,7 +1023,8 @@ class TraduccionTab(QWidget):
                     tl_lang = self.main.config.get("tl_name", "spanish_latino")
                     sdk_dir = os.path.join(gd, 'tl', tl_lang)
                     if not os.path.isdir(sdk_dir):
-                        sdk_path = self.main.config.get("renpy_sdk_path", "")
+                        sdk_path = (self.main.config.get("renpy_sdk_path", "")
+                                    or DEFAULT_RENPY_SDK_PATH)
                         generated = ensure_tl_dir_with_sdk(
                             self, gd, tl_lang, sdk_path, log_cb=self.main.log)
                         if generated and os.path.isdir(generated):
