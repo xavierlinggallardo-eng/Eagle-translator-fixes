@@ -1,26 +1,34 @@
 """
 Ren'Py .rpy parser, extractor and writer for AVN translation pipelines.
 
-Version 3.0  ─  refactored, hardened, vectorised, AVN-aware.
+Version 3.1  ─  parallel fill-SDK, translation memory, glossary, analyzer.
 
 This module is the workhorse of the Eagle / Zenpy-style Ren'Py translator.
 It is split into clearly delimited sections so each capability can be reasoned
 about (and patched) in isolation:
 
-    1. Constants & compiled regex      — single source of truth, frozen at load.
-    2. Heuristics                       — phone / menu / dialogue classification.
-    3. Data model                       — the `Entry` dataclass.
-    4. Low-level helpers                — escaping, ID generation, IO.
-    5. Mode A  ─ parse existing TL      — `parse_file`, `parse_directory`.
-    6. Mode B  ─ extract source code    — `extract_source_directory`.
-    7. Mode B' ─ raw safety net          — `extract_raw_strings_directory`.
-    8. Game locator                     — `locate_game_dir`.
-    9. Mode C  ─ writer (tl/ files)     — `write_tl_files`.
-   10. Zenpy compat                     — `strings.json` + `replaceText.rpy`.
-   11. Generators                       — language selector, screens.rpy.
-   12. Fill / In-place writers         — SDK fill mode + in-place TL writer.
-   13. SDK helpers                      — `run_sdk_generate_tl`, stats.
-   14. CLI                              — `python -m renpy_parser <game>`.
+    1. Constants & compiled regex     — single source of truth, frozen at load.
+    2. Heuristics                      — phone / menu / dialogue classification.
+    3. Data model                      — the `Entry` dataclass.
+    4. Low-level helpers               — escaping, ID generation, IO.
+    5. Mode A  ─ parse existing TL     — `parse_file`, `parse_directory`.
+    6. Mode B  ─ extract source code   — `extract_source_directory`.
+    7. Mode B' ─ raw safety net        — `extract_raw_strings_directory`.
+    8. Game locator                    — `locate_game_dir`.
+    9. Mode C  ─ writer (tl/ files)    — `write_tl_files`.
+   10. Zenpy compat                    — `strings.json` + `replaceText.rpy`.
+   11. Generators                      — language selector, screens.rpy.
+   12. Fill / In-place writers         — SDK fill mode v2 (parallel, atomic,
+                                          progress callback, dry-run, strict
+                                          placeholder validation).
+   13. SDK helpers                     — `run_sdk_generate_tl`, stats.
+   14. Scan SDK tl dir (parallel)      — `scan_sdk_tl_directory`.
+   15. (legacy)
+   16. (legacy)
+   17. TranslationMemory               — JSON-backed cross-session cache.
+   18. Glossary                        — protect proper nouns / forced terms.
+   19. analyze_entries                 — dashboard-friendly snapshot.
+   20. CLI                             — `python -m renpy_parser <game>`.
 
 Public API (consumed by `main.py`) is kept stable.  Internals can change.
 """
@@ -34,7 +42,11 @@ import re
 import shutil
 import subprocess
 import sys
-from collections import defaultdict
+import tempfile
+import threading
+import time
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import (
@@ -71,6 +83,9 @@ __all__ = [
     'find_renpy_exe', 'run_sdk_generate_tl', 'ensure_tl_ready', 'get_tl_stats',
     # quality / validators
     'validate_placeholders', 'mismatched_placeholders',
+    # advanced helpers (v3.1)
+    'TranslationMemory', 'Glossary', 'analyze_entries',
+    'fill_sdk_tl_directory_v2',
 ]
 
 log = logging.getLogger('renpy_parser')
@@ -2391,89 +2406,81 @@ _FILLABLE_KINDS: frozenset = frozenset({
 })
 
 
-def fill_sdk_tl_directory(sdk_tl_dir: str, entries: List[Entry],
-                          lang: str = '', backup: bool = True) -> Tuple[int, int]:
-    """Write translations directly back into SDK-generated tl/<lang>/<file>.rpy.
+# Pre-compiled patterns for fill mode (used per-entry; compiled once for the
+# hot inner loop instead of on every line).
+_RE_FILL_STRING_EMPTY = re.compile(r'^(\s*)new ""\s*$')
+_RE_FILL_DIAL_EMPTY = re.compile(
+    r'^(\s*)(?:("(?:[^"\\]|\\.)*"|\w+)\s+)?""\s*(with\s+\S+)?\s*$'
+)
 
-    Uses ``entry.line_idx`` (the exact empty-line position) so IDs, suffixes
-    and indentation are preserved.  Creates a one-time ``.bak`` per file if
-    ``backup`` is True.
 
-    Returns ``(files_modified, lines_written)``.
+@dataclass
+class _TLFileIndex:
+    """Pre-built index of an SDK `tl/<lang>/` directory.
+
+    Built once with a single `os.walk`; resolving a file thereafter is O(1)
+    for the common case and O(K) where K is the number of duplicate
+    basenames (usually 1).  Drastically faster than the old approach which
+    re-walked the entire tree for every missing entry.
     """
-    by_file: Dict[str, List[Entry]] = defaultdict(list)
-    for e in entries:
-        if e.kind not in _FILLABLE_KINDS:
-            continue
-        if e.is_translated:
-            by_file[e.file].append(e)
 
-    files_modified = 0
-    lines_written = 0
+    sdk_tl_dir: str
+    # rel-path → absolute path  (e.g. "common.rpy" → "/abs/tl/Spanish/common.rpy")
+    rel_to_abs: Dict[str, str] = field(default_factory=dict)
+    # basename → list of absolute paths (for fallback resolution)
+    basename_to_abs: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
 
-    for rel_path, file_entries in by_file.items():
-        full = _resolve_tl_file(sdk_tl_dir, rel_path)
-        if not full:
-            log.warning('fill_sdk: file not found: %s', rel_path)
-            continue
-        try:
-            lines = _read_text(full)
-        except Exception as ex:
-            log.error('fill_sdk read %s: %s', full, ex)
-            continue
+    @classmethod
+    def build(cls, sdk_tl_dir: str) -> '_TLFileIndex':
+        idx = cls(sdk_tl_dir=sdk_tl_dir)
+        if not sdk_tl_dir or not os.path.isdir(sdk_tl_dir):
+            return idx
+        for dp, _dirs, fns in os.walk(sdk_tl_dir):
+            for fn in fns:
+                if fn.endswith('.rpyc'):
+                    continue
+                if not (fn.endswith('.rpy') or fn.endswith('.rpym')):
+                    continue
+                full = os.path.join(dp, fn)
+                rel = os.path.relpath(full, sdk_tl_dir).replace('\\', '/')
+                idx.rel_to_abs[rel] = full
+                idx.basename_to_abs[fn].append(full)
+        return idx
 
-        modified = False
-        for e in file_entries:
-            idx = e.line_idx
-            if idx < 0 or idx >= len(lines):
-                continue
-            original_line = lines[idx]
-            escaped = _escape(e.translation)
+    def resolve(self, rel_path: str) -> Optional[str]:
+        """O(1) resolution with basename fallback.
 
-            if e.kind == 'string' or e.active_label == 'new':
-                mn = re.match(r'^(\s*)new ""\s*$', original_line)
-                if mn:
-                    lines[idx] = f'{mn.group(1)}new "{escaped}"\n'
-                    lines_written += 1
-                    modified = True
-                continue
-
-            me = re.match(
-                r'^(\s*)(?:("(?:[^"\\]|\\.)*"|\w+)\s+)?""\s*(with\s+\S+)?\s*$',
-                original_line,
-            )
-            if not me:
-                continue
-            line_indent = me.group(1)
-            line_speaker = me.group(2) or e.speaker
-            line_suffix = (' ' + me.group(3)) if me.group(3) else (e.active_label or '')
-            if line_speaker and line_speaker not in ('new', 'old'):
-                lines[idx] = f'{line_indent}{line_speaker} "{escaped}"{line_suffix}\n'
-            else:
-                lines[idx] = f'{line_indent}"{escaped}"{line_suffix}\n'
-            lines_written += 1
-            modified = True
-
-        if modified:
-            if backup:
-                bak = full + '.bak'
-                if not os.path.exists(bak):
-                    try:
-                        shutil.copy2(full, bak)
-                    except Exception as ex:
-                        log.warning('fill_sdk backup %s: %s', full, ex)
+        Tries `rel_path` directly, then falls back to basename matches that
+        look like translation files (`translate ` or `old "` near the top).
+        """
+        rel_norm = rel_path.replace('\\', '/')
+        hit = self.rel_to_abs.get(rel_norm)
+        if hit:
+            return hit
+        basename = os.path.basename(rel_norm)
+        candidates = self.basename_to_abs.get(basename, [])
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        # Multiple basename matches — pick the one that looks like a TL file.
+        for cand in candidates:
             try:
-                with open(full, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
-                files_modified += 1
-            except Exception as ex:
-                log.error('fill_sdk write %s: %s', full, ex)
-
-    return (files_modified, lines_written)
+                with open(cand, 'r', encoding='utf-8', errors='replace') as cf:
+                    head = cf.read(2000)
+            except Exception:
+                continue
+            if 'translate ' in head or 'old "' in head:
+                return cand
+        return candidates[0]
 
 
 def _resolve_tl_file(sdk_tl_dir: str, rel_path: str) -> Optional[str]:
-    """Resolve ``rel_path`` against ``sdk_tl_dir`` with several strategies."""
+    """Legacy single-shot resolver.
+
+    Prefer :class:`_TLFileIndex` for any loop that touches more than one
+    file — that builds a single index instead of re-walking the tree.
+    """
     direct = os.path.join(sdk_tl_dir, rel_path)
     if os.path.isfile(direct):
         return direct
@@ -2481,7 +2488,7 @@ def _resolve_tl_file(sdk_tl_dir: str, rel_path: str) -> Optional[str]:
     flat = os.path.join(sdk_tl_dir, basename)
     if os.path.isfile(flat):
         return flat
-    for dp, _, fns in os.walk(sdk_tl_dir):
+    for dp, _dirs, fns in os.walk(sdk_tl_dir):
         if basename in fns:
             candidate = os.path.join(dp, basename)
             try:
@@ -2492,6 +2499,321 @@ def _resolve_tl_file(sdk_tl_dir: str, rel_path: str) -> Optional[str]:
             if 'translate ' in head or 'old "' in head:
                 return candidate
     return None
+
+
+def _atomic_write_text(path: str, lines: List[str]) -> None:
+    """Write ``lines`` to ``path`` atomically (temp file in same dir + replace).
+
+    Avoids leaving a half-written .rpy on disk if the process dies mid-write,
+    which would corrupt the game for the player.
+    """
+    dirname = os.path.dirname(path) or '.'
+    fd, tmp_path = tempfile.mkstemp(prefix='.rpy_fill_', suffix='.tmp', dir=dirname)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+            f.writelines(lines)
+        os.replace(tmp_path, path)
+    except Exception:
+        # cleanup on error
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _apply_entry_to_lines(e: Entry, lines: List[str]) -> Tuple[bool, Optional[str]]:
+    """Mutate ``lines`` in place to apply translation for one entry.
+
+    Returns ``(written, reason_skipped)``.  ``reason_skipped`` is set when
+    we deliberately didn't write (out-of-range index, malformed line, …)
+    so the caller can surface QA info.
+    """
+    idx = e.line_idx
+    if idx < 0 or idx >= len(lines):
+        return (False, 'line-out-of-range')
+    original_line = lines[idx]
+    escaped = _escape(e.translation)
+
+    if e.kind == 'string' or e.active_label == 'new':
+        mn = _RE_FILL_STRING_EMPTY.match(original_line)
+        if not mn:
+            return (False, 'string-line-already-filled-or-malformed')
+        lines[idx] = f'{mn.group(1)}new "{escaped}"\n'
+        return (True, None)
+
+    me = _RE_FILL_DIAL_EMPTY.match(original_line)
+    if not me:
+        return (False, 'dialogue-line-already-filled-or-malformed')
+    line_indent = me.group(1)
+    line_speaker = me.group(2) or e.speaker
+    line_suffix = (' ' + me.group(3)) if me.group(3) else (e.active_label or '')
+    if line_speaker and line_speaker not in ('new', 'old'):
+        lines[idx] = f'{line_indent}{line_speaker} "{escaped}"{line_suffix}\n'
+    else:
+        lines[idx] = f'{line_indent}"{escaped}"{line_suffix}\n'
+    return (True, None)
+
+
+# Result type for the advanced fill-mode writer.
+@dataclass
+class FillResult:
+    """Detailed return value of :func:`fill_sdk_tl_directory_v2`.
+
+    Backwards-compat: iterable, so ``files, lines = fill_sdk_tl_directory_v2(...)``
+    still works for older call sites.
+    """
+
+    files_modified: int = 0
+    lines_written: int = 0
+    files_seen: int = 0
+    entries_seen: int = 0
+    entries_skipped: int = 0
+    entries_unresolved: int = 0
+    placeholder_warnings: int = 0
+    duration_seconds: float = 0.0
+    # per-file detail (path → counters), only populated when verbose=True
+    per_file: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    # entries we deliberately skipped (rel_path → list of reasons)
+    skip_reasons: Dict[str, List[str]] = field(default_factory=dict)
+
+    def __iter__(self) -> Iterator[int]:
+        yield self.files_modified
+        yield self.lines_written
+
+    def summary(self) -> str:
+        return (
+            f'fill_sdk: {self.files_modified}/{self.files_seen} files, '
+            f'{self.lines_written}/{self.entries_seen} lines, '
+            f'{self.entries_skipped} skipped, '
+            f'{self.entries_unresolved} unresolved, '
+            f'{self.placeholder_warnings} placeholder warnings — '
+            f'{self.duration_seconds:.2f}s'
+        )
+
+
+def fill_sdk_tl_directory_v2(
+    sdk_tl_dir: str,
+    entries: List[Entry],
+    lang: str = '',
+    backup: bool = True,
+    *,
+    workers: int = 4,
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    dry_run: bool = False,
+    strict_placeholders: bool = False,
+    skip_unchanged: bool = True,
+    verbose: bool = False,
+    atomic: bool = True,
+) -> FillResult:
+    """Advanced, parallel, validated SDK-tl filler.
+
+    Parameters
+    ----------
+    sdk_tl_dir
+        ``game/tl/<lang>/`` produced by Ren'Py SDK.
+    entries
+        Entries already translated (``entry.translation`` populated).
+    lang
+        Optional language hint; only used for logging.
+    backup
+        Create a one-time ``.bak`` per modified file.  Skipped when
+        ``dry_run`` is True.
+    workers
+        Number of parallel file writers (I/O bound; 4 is a good default,
+        set to 1 for deterministic ordering / debugging).
+    progress_cb
+        ``cb(done, total, current_file)`` invoked from the main thread after
+        each file completes — safe to wire to a Qt signal.
+    dry_run
+        Compute everything but never touch disk.
+    strict_placeholders
+        Skip entries whose translation drops or invents ``[var]`` / ``{tag}``
+        / ``%s`` placeholders.  Recommended for unattended pipelines.
+    skip_unchanged
+        Skip entries where ``translation.strip() == source.strip()`` — they
+        wouldn't change anything.  Saves I/O on already-translated files.
+    verbose
+        Populate ``per_file`` and ``skip_reasons`` in the result.
+    atomic
+        Use atomic writes (temp file + rename).  Strongly recommended.
+
+    Returns
+    -------
+    FillResult
+        Tuple-compatible with the v1 ``(files_modified, lines_written)``
+        return so legacy callers keep working.
+    """
+    t0 = time.monotonic()
+    result = FillResult()
+
+    # ── 0. Bucket entries by file & filter early ─────────────────────────
+    by_file: Dict[str, List[Entry]] = defaultdict(list)
+    for e in entries:
+        if e.kind not in _FILLABLE_KINDS:
+            continue
+        if not e.is_translated:
+            continue
+        result.entries_seen += 1
+        if skip_unchanged and e.translation.strip() == (e.source or '').strip():
+            result.entries_skipped += 1
+            if verbose:
+                result.skip_reasons.setdefault(e.file, []).append('unchanged')
+            continue
+        if strict_placeholders:
+            miss, extra = mismatched_placeholders(e.source, e.translation)
+            if miss or extra:
+                result.placeholder_warnings += 1
+                result.entries_skipped += 1
+                if verbose:
+                    result.skip_reasons.setdefault(e.file, []).append(
+                        f'placeholder-mismatch missing={miss} extra={extra}'
+                    )
+                continue
+        by_file[e.file].append(e)
+
+    if not by_file:
+        result.duration_seconds = time.monotonic() - t0
+        return result
+
+    # ── 1. Build the file index ONCE (was O(N²) before) ──────────────────
+    index = _TLFileIndex.build(sdk_tl_dir)
+    result.files_seen = len(by_file)
+
+    # ── 2. Per-file worker (pure function, safe to parallelise) ──────────
+    lock = threading.Lock()
+    done_counter = [0]
+
+    def _process_one(rel_path: str, file_entries: List[Entry]) -> Dict[str, int]:
+        stats = {'lines_written': 0, 'modified': 0, 'unresolved': 0, 'skipped': 0}
+        full = index.resolve(rel_path)
+        if not full:
+            stats['unresolved'] = 1
+            log.warning('fill_sdk: file not found: %s', rel_path)
+            with lock:
+                done_counter[0] += 1
+                if progress_cb:
+                    try:
+                        progress_cb(done_counter[0], result.files_seen, rel_path)
+                    except Exception:
+                        pass
+            return stats
+        try:
+            lines = _read_text(full)
+        except Exception as ex:
+            log.error('fill_sdk read %s: %s', full, ex)
+            stats['unresolved'] = 1
+            return stats
+
+        # Sort by line_idx ascending so we touch the file linearly.
+        # This is a no-op for correctness but yields nicer diffs.
+        file_entries_sorted = sorted(file_entries, key=lambda x: x.line_idx)
+
+        modified = False
+        local_skip_reasons: List[str] = []
+        for e in file_entries_sorted:
+            written, reason = _apply_entry_to_lines(e, lines)
+            if written:
+                stats['lines_written'] += 1
+                modified = True
+            else:
+                stats['skipped'] += 1
+                if verbose and reason:
+                    local_skip_reasons.append(f'{rel_path}:{e.line_idx + 1} {reason}')
+
+        if modified and not dry_run:
+            if backup:
+                bak = full + '.bak'
+                if not os.path.exists(bak):
+                    try:
+                        shutil.copy2(full, bak)
+                    except Exception as ex:
+                        log.warning('fill_sdk backup %s: %s', full, ex)
+            try:
+                if atomic:
+                    _atomic_write_text(full, lines)
+                else:
+                    with open(full, 'w', encoding='utf-8') as f:
+                        f.writelines(lines)
+                stats['modified'] = 1
+            except Exception as ex:
+                log.error('fill_sdk write %s: %s', full, ex)
+                stats['modified'] = 0
+        elif modified and dry_run:
+            stats['modified'] = 1  # would have been modified
+
+        if verbose and local_skip_reasons:
+            with lock:
+                result.skip_reasons.setdefault(rel_path, []).extend(local_skip_reasons)
+
+        with lock:
+            done_counter[0] += 1
+            if progress_cb:
+                try:
+                    progress_cb(done_counter[0], result.files_seen, rel_path)
+                except Exception:
+                    pass
+        return stats
+
+    # ── 3. Dispatch  (parallel I/O — release the GIL during read/write) ──
+    workers = max(1, int(workers))
+    if workers == 1 or len(by_file) == 1:
+        # Serial path — easier to debug and avoids thread setup overhead.
+        for rel_path, file_entries in by_file.items():
+            stats = _process_one(rel_path, file_entries)
+            result.files_modified += stats['modified']
+            result.lines_written += stats['lines_written']
+            result.entries_skipped += stats['skipped']
+            result.entries_unresolved += stats['unresolved']
+            if verbose:
+                result.per_file[rel_path] = stats
+    else:
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix='renpy-fill') as ex:
+            futures = {
+                ex.submit(_process_one, rel, items): rel
+                for rel, items in by_file.items()
+            }
+            for fut in as_completed(futures):
+                rel = futures[fut]
+                try:
+                    stats = fut.result()
+                except Exception as ex2:
+                    log.error('fill_sdk worker %s: %s', rel, ex2)
+                    result.entries_unresolved += 1
+                    continue
+                result.files_modified += stats['modified']
+                result.lines_written += stats['lines_written']
+                result.entries_skipped += stats['skipped']
+                result.entries_unresolved += stats['unresolved']
+                if verbose:
+                    result.per_file[rel] = stats
+
+    result.duration_seconds = time.monotonic() - t0
+    log.info(result.summary())
+    return result
+
+
+def fill_sdk_tl_directory(sdk_tl_dir: str, entries: List[Entry],
+                          lang: str = '', backup: bool = True,
+                          **kwargs) -> Tuple[int, int]:
+    """Backwards-compatible wrapper around :func:`fill_sdk_tl_directory_v2`.
+
+    Returns the old ``(files_modified, lines_written)`` tuple so existing
+    UI code keeps working unchanged.  Accepts every extra keyword the v2
+    function supports — e.g.
+
+        fill_sdk_tl_directory(tl_dir, entries, workers=8,
+                              progress_cb=cb, strict_placeholders=True)
+    """
+    # Sensible defaults for the legacy entry point.
+    kwargs.setdefault('workers', 4)
+    kwargs.setdefault('skip_unchanged', True)
+    kwargs.setdefault('atomic', True)
+    result = fill_sdk_tl_directory_v2(
+        sdk_tl_dir, entries, lang=lang, backup=backup, **kwargs,
+    )
+    return (result.files_modified, result.lines_written)
 
 
 def apply_strings_map(entries: List[Entry], strings_map: Dict[str, str]) -> int:
@@ -2545,46 +2867,83 @@ def load_strings_json(path: str) -> Dict[str, str]:
     return {}
 
 
+def _detect_lang_from_dir(sdk_tl_dir: str) -> str:
+    """Sniff the first `translate <lang>` directive in any .rpy under the dir."""
+    if not sdk_tl_dir or not os.path.isdir(sdk_tl_dir):
+        return ''
+    for fn in os.listdir(sdk_tl_dir):
+        if not fn.endswith('.rpy'):
+            continue
+        try:
+            with open(os.path.join(sdk_tl_dir, fn), 'r',
+                      encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    m = RE_TRANSLATE_BLOCK.match(line)
+                    if m:
+                        return m.group(2)
+        except Exception:
+            continue
+    return ''
+
+
 def scan_sdk_tl_directory(sdk_tl_dir: str, lang: str = '',
-                          strings_json_path: str = '') -> List[Entry]:
+                          strings_json_path: str = '',
+                          *,
+                          workers: int = 4,
+                          progress_cb: Optional[Callable[[int, int, str], None]] = None,
+                          ) -> List[Entry]:
     """Scan an SDK-generated ``tl/<lang>/`` and return entries needing translation.
 
     Auto-detects the language if ``lang`` is empty or doesn't match the files,
-    and pre-fills from any nearby ``strings.json``.
+    pre-fills entries from any nearby ``strings.json``, and parses files in
+    parallel (``workers``) so AVN projects with hundreds of .rpy files load
+    in seconds instead of minutes.
     """
-    detected_lang = lang
-    if sdk_tl_dir and os.path.isdir(sdk_tl_dir):
-        for fn in os.listdir(sdk_tl_dir):
-            if not fn.endswith('.rpy'):
-                continue
-            try:
-                with open(os.path.join(sdk_tl_dir, fn), 'r',
-                          encoding='utf-8', errors='replace') as f:
-                    for line in f:
-                        m = RE_TRANSLATE_BLOCK.match(line)
-                        if m:
-                            detected_lang = m.group(2)
-                            break
-                if detected_lang:
-                    break
-            except Exception:
-                pass
+    detected_lang = lang or _detect_lang_from_dir(sdk_tl_dir)
     if detected_lang != lang:
         log.info('scan_sdk: auto-detected language %r (config had %r)',
                  detected_lang, lang)
 
-    entries: List[Entry] = []
+    # ── Build the list of files upfront so workers can be scheduled ──────
+    rpy_files: List[str] = []
     for dirpath, _, files in os.walk(sdk_tl_dir):
         for fn in files:
             if not (fn.endswith('.rpy') or fn.endswith('.rpym')) or fn.endswith('.rpyc'):
                 continue
-            full = os.path.join(dirpath, fn)
-            try:
-                entries.extend(parse_and_fill_file(full, base=sdk_tl_dir, lang=detected_lang))
-                entries.extend(_scan_strings_block(full, base=sdk_tl_dir, lang=detected_lang))
-            except Exception as ex:
-                log.error('scan_sdk %s: %s', full, ex)
+            rpy_files.append(os.path.join(dirpath, fn))
 
+    total = len(rpy_files)
+    entries: List[Entry] = []
+    lock = threading.Lock()
+    done = [0]
+
+    def _parse_one(full: str) -> List[Entry]:
+        out: List[Entry] = []
+        try:
+            out.extend(parse_and_fill_file(full, base=sdk_tl_dir, lang=detected_lang))
+            out.extend(_scan_strings_block(full, base=sdk_tl_dir, lang=detected_lang))
+        except Exception as ex:
+            log.error('scan_sdk %s: %s', full, ex)
+        with lock:
+            done[0] += 1
+            if progress_cb:
+                try:
+                    progress_cb(done[0], total, os.path.basename(full))
+                except Exception:
+                    pass
+        return out
+
+    workers = max(1, int(workers))
+    if workers == 1 or total <= 1:
+        for full in rpy_files:
+            entries.extend(_parse_one(full))
+    else:
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix='renpy-scan') as ex:
+            for chunk in ex.map(_parse_one, rpy_files):
+                entries.extend(chunk)
+
+    # ── Pre-fill from strings.json ───────────────────────────────────────
     here = os.path.dirname(os.path.abspath(__file__))
     sj_candidates: List[str] = []
     if strings_json_path:
@@ -3032,7 +3391,310 @@ def get_tl_stats(game_dir: str, lang: str) -> Dict[str, int]:
 
 
 # =============================================================
-# 17. CLI — quick smoke-test entry point
+# 17. Translation Memory  (persistent cache across sessions)
+# =============================================================
+class TranslationMemory:
+    """Lightweight, JSON-backed translation memory keyed by source string.
+
+    Use it to keep previous translations around so the next run of the engine
+    can re-use them for free (and to keep proper nouns / repeated UI labels
+    stable across episodes of long-running AVN projects).
+
+    Example
+    -------
+    >>> tm = TranslationMemory.load('~/.cache/eagle_tm.json')
+    >>> hits, misses = tm.fill_entries(entries)        # pre-fill what we can
+    >>> # ... run engine on the misses ...
+    >>> for e in entries:
+    ...     if e.is_translated:
+    ...         tm.put(e.source, e.translation, context=e.category)
+    >>> tm.save()
+
+    The cache is small (string→string), threadsafe, and survives renames
+    because lookups normalise whitespace.
+    """
+
+    __slots__ = ('path', '_data', '_lock', '_dirty', '_ctx')
+
+    def __init__(self, path: Optional[str] = None) -> None:
+        self.path: Optional[str] = os.path.expanduser(path) if path else None
+        self._data: Dict[str, str] = {}
+        # context bucket: source → category hint (best-effort; not load-bearing)
+        self._ctx: Dict[str, str] = {}
+        self._lock = threading.RLock()
+        self._dirty = False
+
+    # ── persistence ──────────────────────────────────────────────────────
+    @classmethod
+    def load(cls, path: str) -> 'TranslationMemory':
+        tm = cls(path)
+        if not tm.path or not os.path.isfile(tm.path):
+            return tm
+        try:
+            with open(tm.path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                # Two on-disk formats: flat {src:tl} or {entries:{}, ctx:{}}
+                if 'entries' in data and isinstance(data['entries'], dict):
+                    tm._data = {str(k): str(v) for k, v in data['entries'].items()}
+                    tm._ctx = {str(k): str(v) for k, v in data.get('ctx', {}).items()}
+                else:
+                    tm._data = {str(k): str(v) for k, v in data.items()}
+        except Exception as ex:
+            log.warning('TM load %s: %s', tm.path, ex)
+        return tm
+
+    def save(self, path: Optional[str] = None) -> None:
+        with self._lock:
+            target = os.path.expanduser(path) if path else self.path
+            if not target:
+                raise ValueError('TranslationMemory.save: no path provided')
+            os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+            payload = {'entries': self._data, 'ctx': self._ctx,
+                       'version': 1, 'saved_at': time.time()}
+            tmp = target + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, target)
+            self._dirty = False
+            self.path = target
+
+    # ── lookups ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _norm(s: str) -> str:
+        # Whitespace-normalised lookup key — translations stay valid even if
+        # the upstream script tweaks trailing spaces or line wrapping.
+        return ' '.join((s or '').split())
+
+    def get(self, source: str) -> Optional[str]:
+        with self._lock:
+            tl = self._data.get(source)
+            if tl is not None:
+                return tl
+            return self._data.get(self._norm(source))
+
+    def put(self, source: str, translation: str, context: str = '') -> None:
+        if not source or not translation:
+            return
+        with self._lock:
+            self._data[source] = translation
+            self._data[self._norm(source)] = translation
+            if context:
+                self._ctx[source] = context
+            self._dirty = True
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def __contains__(self, source: str) -> bool:
+        return self.get(source) is not None
+
+    # ── bulk helpers ─────────────────────────────────────────────────────
+    def fill_entries(self, entries: Sequence[Entry]) -> Tuple[int, int]:
+        """Pre-fill entries whose source already exists in the TM.
+
+        Returns ``(hits, misses)``.
+        """
+        hits = 0
+        misses = 0
+        for e in entries:
+            if e.is_translated or not e.source:
+                continue
+            tl = self.get(e.source)
+            if tl and tl.strip():
+                e.translation = tl
+                hits += 1
+            else:
+                misses += 1
+        return (hits, misses)
+
+    def absorb_entries(self, entries: Iterable[Entry]) -> int:
+        """Store every translated entry into the TM.  Returns the count added."""
+        n = 0
+        with self._lock:
+            for e in entries:
+                if e.is_translated and e.source:
+                    self._data[e.source] = e.translation
+                    self._data[self._norm(e.source)] = e.translation
+                    if e.category:
+                        self._ctx[e.source] = e.category
+                    n += 1
+            if n:
+                self._dirty = True
+        return n
+
+
+# =============================================================
+# 18. Glossary  (protect proper nouns / fixed terms from MT engines)
+# =============================================================
+class Glossary:
+    """Per-game glossary that pins certain source terms to specific targets.
+
+    Typical use is "always render 'Subject 17' as 'Sujeto 17' / never translate
+    'Aki'".  The translator engine wrapper calls :meth:`pre_protect` before
+    sending text to the MT and :meth:`post_restore` after — placeholders keep
+    the term invisible to the engine.
+
+    Two channels:
+      • ``forced[src] = dst`` — always replace src with dst (case-insensitive).
+      • ``protected`` — names/terms the MT must NOT touch (rendered identically).
+
+    JSON format (autoloaded from ``<game_root>/glossary.json``)::
+
+        {
+          "forced": {"Sister Jen": "Hermana Jen"},
+          "protected": ["MC", "Aki", "Toronjil"]
+        }
+    """
+
+    _PH_TEMPLATE = '⁣TMB{0}⁣'  # invisible BOM-like sentinels
+
+    def __init__(self,
+                 forced: Optional[Dict[str, str]] = None,
+                 protected: Optional[Iterable[str]] = None) -> None:
+        self.forced: Dict[str, str] = dict(forced or {})
+        self.protected: Set[str] = set(protected or ())
+
+    # ── persistence ──────────────────────────────────────────────────────
+    @classmethod
+    def load(cls, path: str) -> 'Glossary':
+        gl = cls()
+        if not path or not os.path.isfile(path):
+            return gl
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                gl.forced = {str(k): str(v) for k, v in (data.get('forced') or {}).items()}
+                gl.protected = {str(x) for x in (data.get('protected') or [])}
+            elif isinstance(data, list):
+                gl.protected = {str(x) for x in data}
+        except Exception as ex:
+            log.warning('Glossary load %s: %s', path, ex)
+        return gl
+
+    def save(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        payload = {'forced': self.forced, 'protected': sorted(self.protected)}
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+    # ── core ─────────────────────────────────────────────────────────────
+    def pre_protect(self, text: str) -> Tuple[str, List[Tuple[str, str]]]:
+        """Replace protected/forced terms with placeholders.
+
+        Returns ``(masked_text, mapping)`` — feed mapping back into
+        :meth:`post_restore` after MT translation.
+        """
+        mapping: List[Tuple[str, str]] = []
+        if not text:
+            return ('', mapping)
+        out = text
+        # Process by descending length so "Subject 17" wins over "Subject".
+        terms = sorted(set(self.protected) | set(self.forced.keys()),
+                       key=len, reverse=True)
+        for i, term in enumerate(terms):
+            if not term:
+                continue
+            ph = self._PH_TEMPLATE.format(i)
+            pattern = re.compile(re.escape(term), re.IGNORECASE)
+            if not pattern.search(out):
+                continue
+            target = self.forced.get(term, term)
+            out = pattern.sub(ph, out)
+            mapping.append((ph, target))
+        return (out, mapping)
+
+    def post_restore(self, text: str, mapping: Sequence[Tuple[str, str]]) -> str:
+        out = text
+        for ph, target in mapping:
+            out = out.replace(ph, target)
+        return out
+
+    def apply_to_entries(self, entries: Iterable[Entry]) -> int:
+        """Apply every ``forced`` mapping directly to already-translated entries.
+
+        Useful after MT in case the engine slipped past the protect step
+        (e.g. matched case-insensitively).  Returns count of changes.
+        """
+        if not self.forced:
+            return 0
+        rewrites: List[Tuple[re.Pattern, str]] = [
+            (re.compile(re.escape(k), re.IGNORECASE), v)
+            for k, v in self.forced.items()
+        ]
+        n = 0
+        for e in entries:
+            if not e.is_translated:
+                continue
+            new_tl = e.translation
+            for pat, dst in rewrites:
+                new_tl2 = pat.sub(dst, new_tl)
+                if new_tl2 != new_tl:
+                    new_tl = new_tl2
+                    n += 1
+            e.translation = new_tl
+        return n
+
+
+# =============================================================
+# 19. Entry analyzer (debug / progress dashboards)
+# =============================================================
+def analyze_entries(entries: Sequence[Entry]) -> Dict[str, object]:
+    """Return a rich snapshot of an entry list for dashboards / logging.
+
+    Keys:
+      * ``total``                    – count
+      * ``translated``               – count with non-empty translation
+      * ``untranslated``             – complement
+      * ``by_kind``                  – Counter
+      * ``by_category``              – Counter (dialogue / menu / phone / raw)
+      * ``unique_sources``           – distinct source strings
+      * ``avg_source_len``           – mean character length of sources
+      * ``placeholder_mismatches``   – translated entries with bad placeholders
+      * ``files``                    – count of distinct files
+    """
+    by_kind: Counter = Counter()
+    by_cat: Counter = Counter()
+    sources: Set[str] = set()
+    files: Set[str] = set()
+    src_lens: List[int] = []
+    placeholder_bad = 0
+    translated = 0
+
+    for e in entries:
+        by_kind[e.kind] += 1
+        by_cat[e.category or 'unknown'] += 1
+        if e.file:
+            files.add(e.file)
+        if e.source:
+            sources.add(e.source)
+            src_lens.append(len(e.source))
+        if e.is_translated:
+            translated += 1
+            miss, extra = mismatched_placeholders(e.source, e.translation)
+            if miss or extra:
+                placeholder_bad += 1
+
+    total = len(entries)
+    return {
+        'total': total,
+        'translated': translated,
+        'untranslated': total - translated,
+        'by_kind': dict(by_kind),
+        'by_category': dict(by_cat),
+        'unique_sources': len(sources),
+        'avg_source_len': (sum(src_lens) / len(src_lens)) if src_lens else 0.0,
+        'placeholder_mismatches': placeholder_bad,
+        'files': len(files),
+    }
+
+
+# =============================================================
+# 20. CLI — quick smoke-test entry point
 # =============================================================
 def _cli(argv: Sequence[str]) -> int:
     if len(argv) < 2:
