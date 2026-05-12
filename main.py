@@ -521,7 +521,7 @@ _RE_SDK_TR_BLOCK   = re.compile(r'^(\s*)translate\s+(\S+)\s+(\S+)\s*:\s*$')
 _RE_SDK_TR_STRINGS = re.compile(r'^(\s*)translate\s+(\S+)\s+strings\s*:\s*$')
 _RE_SDK_NEW        = re.compile(r'^(\s+)new\s+"((?:[^"\\]|\\.)*)"\s*$')
 _RE_SDK_DLG        = re.compile(
-    r'^(\s+)((?:"(?:[^"\\]|\\.)*"|\w+)\s+)?"((?:[^"\\]|\\.)*)"(\s*(?:with\s+\S+)?)\s*$'
+    r'^(\s+)((?:"(?:[^"\\]|\\.)*"|\w+)\s+)?"((?:[^"\\]|\\.)*)"(.*)$'
 )
 
 
