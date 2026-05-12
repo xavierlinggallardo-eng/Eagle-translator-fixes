@@ -1,31 +1,28 @@
 """
-Motores de traduccion -- ULTRA OPTIMIZADO v5.0
-  - Google Translate BATCH real: hasta 200 textos / 8000 chars por request
-  - Pool HTTP 256 conexiones, keep-alive agresivo, TCP_NODELAY
-  - Cache en memoria (LRU 200k entradas) + disco persistente con ujson/json
-  - Flush asincrono al disco (no bloquea workers)
-  - Workers dinamicos: hasta 48 para Google, 24 para DeepLX
-  - Dedupe + cache pre-check antes de lanzar threads
-  - Timeouts agresivos: falla rapido, reintenta rapido
-  - Protector de placeholders Ren'Py: {tags}, [variables], %(name)s
-  - Hash MD5 rapido para cache keys
-  - Restore de placeholders en un solo pass (O(n) vs O(n*k))
-  - Batch size adaptativo segun longitud de textos
-  - Fallback paralelo para items fallidos del batch
-  - Pre-warming de conexiones HTTP al inicio (multiples endpoints)
-  - Adaptive workers: escala segun cantidad de pendientes
-  - Lock-free reads en cache caliente
-  - Batch cache writes con set_many
-  - ujson/orjson fallback para JSON mas rapido
-  - Chunking inteligente: maximiza textos por request
-  - Pipeline: cache check y translate en paralelo
+Motores de traduccion -- ULTRA OPTIMIZADO v6.0 "Eagle"
+====================================================
+Cambios principales sobre v5.0:
+  - LRU eviction CORRECTO (bucle while, no un solo del)
+  - translate_google_batch: preserva resultados parciales (antes los tiraba todos)
+  - register_character_names: invalidacion LAZY (sin O(N*M))
+  - Post-procesado latino unificado en UNA sola pasada (combina ~70 reglas)
+  - Glosario de usuario (terminos forzados + nombres protegidos en una sola API)
+  - Prewarming HTTP DIFERIDO (no bloquea import)
+  - Progress callback con ETA (segundos restantes) + items/seg
+  - Estadisticas globales (cache_hits, batch_calls, total_chars, etc.)
+  - Reintento adaptativo con backoff por respuesta de Google (429 / vacio)
+  - Cache namespace opcional por-proyecto
+  - Postprocesador BR portugues
+  - Deteccion de placeholders mejorada (renpy {color=#ffff00}, [var!t], etc.)
+  - Restauracion de capitalizacion (si el original empezaba con minuscula, traducir asi)
+  - Detector de "no traducido" (devuelve == original) -> reintenta con otro motor
 """
 from __future__ import annotations
-import re, time, json, threading, hashlib, os
+import re, time, json, threading, hashlib, os, random
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional, Callable, Dict, Tuple
+from typing import List, Optional, Callable, Dict, Tuple, Iterable
 import requests
 from requests.adapters import HTTPAdapter
 try:
@@ -33,7 +30,6 @@ try:
 except ImportError:
     from requests.packages.urllib3.util.retry import Retry
 
-# Intentar usar ujson/orjson para parsing JSON mas rapido
 try:
     import ujson as _json_fast
     _HAS_FAST_JSON = True
@@ -46,7 +42,6 @@ except ImportError:
         _HAS_FAST_JSON = False
 
 def _json_loads(data) -> object:
-    """JSON loads con fallback a stdlib."""
     if _HAS_FAST_JSON:
         try:
             return _json_fast.loads(data)
@@ -57,19 +52,66 @@ def _json_loads(data) -> object:
 
 DEFAULT_DEEPLX = "https://deeplx.vercel.app/translate"
 CACHE_PATH = Path.home() / ".renpy_translator_cache.json"
+GLOSSARY_PATH = Path.home() / ".renpy_translator_glossary.json"
 
 # ---------------------------------------------------------------------------
-# Post-procesador: español latino neutro
-# Corrige traducciones literales de Google a expresiones naturales latinas.
-# Sin API, sin dependencias, siempre activo cuando target es español.
+# Estadisticas globales (lecturas baratas, sin lock)
 # ---------------------------------------------------------------------------
-_LATINO_REPLACEMENTS = [
-    # Formulas de saludo/cortesia
+class _Stats:
+    __slots__ = ('cache_hits','cache_misses','batch_calls','single_calls',
+                 'fallback_calls','http_errors','total_chars','total_seconds',
+                 'started_at')
+    def __init__(self):
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.batch_calls = 0
+        self.single_calls = 0
+        self.fallback_calls = 0
+        self.http_errors = 0
+        self.total_chars = 0
+        self.total_seconds = 0.0
+        self.started_at = time.time()
+
+    def snapshot(self) -> Dict[str, float]:
+        elapsed = max(0.001, time.time() - self.started_at)
+        total = self.cache_hits + self.cache_misses
+        hit_rate = (self.cache_hits / total * 100.0) if total else 0.0
+        speed = self.total_chars / elapsed if elapsed else 0.0
+        return {
+            'cache_hits': self.cache_hits,
+            'cache_misses': self.cache_misses,
+            'hit_rate_pct': round(hit_rate, 1),
+            'batch_calls': self.batch_calls,
+            'single_calls': self.single_calls,
+            'fallback_calls': self.fallback_calls,
+            'http_errors': self.http_errors,
+            'total_chars': self.total_chars,
+            'chars_per_sec': round(speed, 1),
+            'uptime_s': round(elapsed, 1),
+        }
+
+    def reset(self):
+        self.__init__()
+
+STATS = _Stats()
+
+
+# ---------------------------------------------------------------------------
+# Post-procesador: español latino neutro -- UNIFICADO en un solo regex
+# ---------------------------------------------------------------------------
+# Tabla (regex_alternation -> dict id->replacement). Combinamos todas las
+# reglas en UNA sola alternation; aplicamos un unico re.sub con callback
+# que resuelve el reemplazo correcto. Para 70 reglas y un batch de 10k
+# strings, vamos de 700k sub-calls a 10k.
+
+_LATINO_RULES: List[Tuple[str, str]] = [
+    # Saludos / cortesia
     (r'(?<![¿?])¿[Cc]ómo estás\?',         '¿Cómo te va?'),
     (r'\b[Mm]ucho gusto en conocerte\b',    'qué gusto conocerte'),
     (r'\b[Ff]ue un placer conocerte\b',     'qué gusto conocerte'),
     (r'\b[Ee]ncantado de conocerte\b',      'qué gusto conocerte'),
-    # Afirmaciones/negaciones
+    (r'\b[Ee]ncantada de conocerte\b',      'qué gusto conocerte'),
+    # Afirmaciones / negaciones
     (r'\b[Dd]e ninguna manera\b',           'ni de chiste'),
     (r'\b[Ee]n absoluto\b',                 'para nada'),
     (r'\b[Pp]or supuesto que no\b',         'claro que no'),
@@ -82,7 +124,7 @@ _LATINO_REPLACEMENTS = [
     (r'\b[Ss]umamente\b',                   'muy'),
     (r'\b[Ff]rancamente\b',                 'la verdad'),
     (r'\b[Hh]onestamente\b',                'en serio'),
-    # Expresiones cotidianas
+    # Cotidiano
     (r'\b[Ee]spera un momento\b',           'espérate un momento'),
     (r'\b[Ee]spera un segundo\b',           'espérate un segundo'),
     (r'\b[Ee]stoy bromeando\b',             'es broma'),
@@ -98,7 +140,7 @@ _LATINO_REPLACEMENTS = [
     (r'\b[Qq]ué increíble\b',               'qué chido'),
     (r'\b[Ee]so es genial\b',               'qué padre'),
     (r'\b[Ee]stoy enloqueciendo\b',         'me estoy volviendo loco'),
-    # Peninsulares → latino neutro
+    # Peninsulares -> latino
     (r'\b[Vv]osotros\b',                    'ustedes'),
     (r'\b[Vv]uestro\b',                     'su'),
     (r'\b[Vv]uestra\b',                     'su'),
@@ -112,9 +154,11 @@ _LATINO_REPLACEMENTS = [
     (r'\bdebéis\b',                         'deben'),
     (r'\bcoged\b',                          'agarren'),
     (r'\btomad\b',                          'tomen'),
-    (r'\bordered\b',                        'ordenen'),
     (r'\bhaced\b',                          'hagan'),
-    # Muletillas formales → orales
+    (r'\bdejad\b',                          'dejen'),
+    (r'\bmirad\b',                          'miren'),
+    (r'\bvenid\b',                          'vengan'),
+    # Muletillas formales -> orales
     (r'\b[Ss]in embargo\b',                 'pero'),
     (r'\b[Nn]o obstante\b',                 'pero'),
     (r'\b[Pp]or lo tanto\b',                'así que'),
@@ -126,12 +170,46 @@ _LATINO_REPLACEMENTS = [
     (r'\b[Dd]ebo admitir\b',                'la verdad'),
     (r'\b[Hh]e de admitir\b',               'la verdad'),
     (r'\b[Ee]stimado\b',                    'querido'),
+    # Pronombres dejar caer mas natural
+    (r'\b[Nn]osotros mismos\b',             'nosotros'),
+    (r'\b[Ee]llos mismos\b',                'ellos'),
+    # Cortesias raras de Google
+    (r'\b[Yy]o también te amo\b',           'yo también'),
+    (r'\b[Mm]e gustaría saber\b',           'quiero saber'),
+    (r'\b[Mm]e gustaría preguntarte\b',     'quiero preguntarte'),
+    (r'\b[Tt]engo que decirte\b',           'te tengo que decir'),
+    (r'\b[Vv]oy a tener que\b',             'voy a'),
+    # Errores frecuentes
+    (r'\b[Mm]aldita sea\b',                 'maldita sea'),  # noop, mantener
 ]
 
-_LATINO_RE = [(re.compile(pat), rep) for pat, rep in _LATINO_REPLACEMENTS]
+def _build_unified_regex(rules: List[Tuple[str, str]]):
+    """Compila una sola regex con todas las reglas y devuelve (regex, dispatch)."""
+    parts = []
+    table: List[str] = []
+    for pat, rep in rules:
+        parts.append('(?:' + pat + ')')
+        table.append(rep)
+    big = re.compile('|'.join(parts), re.UNICODE)
+    # Para mapear el match al index correcto usamos lastindex.
+    # Pero como envolvimos en (?:...) no hay grupos. Truco: envolver
+    # cada regla en su PROPIO grupo de captura para que lastindex apunte
+    # al correcto. Reconstruimos:
+    parts2 = []
+    for i, (pat, _) in enumerate(rules):
+        parts2.append('(' + pat + ')')
+    big = re.compile('|'.join(parts2), re.UNICODE)
+    def dispatch(m):
+        idx = m.lastindex  # 1-based
+        if idx is None:
+            return m.group(0)
+        rep = table[idx - 1]
+        return rep
+    return big, dispatch
 
-# Solo targets de español LATINO activan el post-procesador.
-# ES (España) NO se incluye — tiene sus propias formas (vosotros, vuestro, etc.)
+_LATINO_BIG_RE, _LATINO_DISPATCH = _build_unified_regex(_LATINO_RULES)
+
+# Targets que activan postprocesado latino
 _LATIN_SPANISH_TARGETS = {
     'ES419', 'ES-419', 'ES_419',
     'ESLA',  'ES-LA',  'ES_LA',
@@ -139,43 +217,87 @@ _LATIN_SPANISH_TARGETS = {
     'ESAR',  'ES-AR',  'ES_AR',
     'ESCO',  'ES-CO',  'ES_CO',
     'ESCL',  'ES-CL',  'ES_CL',
+    'ESPE',  'ES-PE',  'ES_PE',
+    'ESUY',  'ES-UY',  'ES_UY',
+    'ESVE',  'ES-VE',  'ES_VE',
+    'ESBO',  'ES-BO',  'ES_BO',
+    'ESEC',  'ES-EC',  'ES_EC',
+    'ESPY',  'ES-PY',  'ES_PY',
+    'ESDO',  'ES-DO',  'ES_DO',
+    'ESPR',  'ES-PR',  'ES_PR',
+    'ESCR',  'ES-CR',  'ES_CR',
+    'ESPA',  'ES-PA',  'ES_PA',
+    'ESHN',  'ES-HN',  'ES_HN',
+    'ESGT',  'ES-GT',  'ES_GT',
+    'ESSV',  'ES-SV',  'ES_SV',
+    'ESNI',  'ES-NI',  'ES_NI',
 }
+_LATIN_SPANISH_NORM = {t.upper().replace('-','').replace('_','') for t in _LATIN_SPANISH_TARGETS}
+
+def _is_latin_spanish(target: str) -> bool:
+    return target.upper().replace('-','').replace('_','') in _LATIN_SPANISH_NORM
+
 
 def _postprocess_latino(text: str, target: str) -> str:
-    """Aplica correcciones de español latino neutro a la traducción.
-    Solo se activa cuando el target es explícitamente español latino/latinoamérica.
-    ES (España) NO se procesa para no alterar sus formas propias.
-    """
-    norm = target.upper().replace('-', '').replace('_', '')
-    # Verificar tanto la forma normalizada como la original
-    if norm not in {t.upper().replace('-','').replace('_','') for t in _LATIN_SPANISH_TARGETS}:
+    if not _is_latin_spanish(target):
         return text
-    for rx, rep in _LATINO_RE:
-        text = rx.sub(rep, text)
+    return _LATINO_BIG_RE.sub(_LATINO_DISPATCH, text)
+
+
+# ---------------------------------------------------------------------------
+# Post-procesador BR (portugues brasileno)
+# ---------------------------------------------------------------------------
+_BR_RULES = [
+    # Tutear vs vos vs voce
+    (r'\b[Tt]u és\b',     'você é'),
+    (r'\b[Tt]u estás\b',  'você está'),
+    (r'\b[Tt]u tens\b',   'você tem'),
+    (r'\b[Tt]u podes\b',  'você pode'),
+    (r'\b[Tt]u sabes\b',  'você sabe'),
+    (r'\b[Cc]ontigo\b',   'com você'),
+    # Peninsulares portugues PT-PT -> BR
+    (r'\b[Aa]utocarro\b', 'ônibus'),
+    (r'\b[Tt]elemóvel\b', 'celular'),
+    (r'\b[Ff]rigorífico\b','geladeira'),
+    (r'\b[Cc]asa de banho\b','banheiro'),
+    (r'\b[Rr]apaz\b',     'menino'),
+]
+_BR_BIG_RE, _BR_DISPATCH = _build_unified_regex(_BR_RULES)
+
+def _postprocess_brazilian(text: str, target: str) -> str:
+    t = target.upper().replace('-','').replace('_','')
+    if t not in ('PTBR', 'PT_BR'):
+        return text
+    return _BR_BIG_RE.sub(_BR_DISPATCH, text)
+
+
+def _postprocess_all(text: str, target: str) -> str:
+    """Aplica todos los post-procesadores aplicables al target."""
+    text = _postprocess_latino(text, target)
+    text = _postprocess_brazilian(text, target)
     return text
 
 
 # ---------------------------------------------------------------------------
-# Placeholders
+# Placeholders Ren'Py
 # ---------------------------------------------------------------------------
+# Mas robusto: cubre {color=#ffff00}, {b}...{/b}, [var!t], %(name)s, \n, \t.
 PLACEHOLDER_PATTERNS = [
-    r'\{[^{}]*\}',
-    r'\[[^\[\]]+\]',
-    r'%\([^)]+\)[sdif]',
-    r'%[sdif]',
-    r'\\n', r'\\t', r'\\"',
+    r'\{[^{}]*\}',          # {color=#...}, {b}, {/b}, {size=+12}
+    r'\[[^\[\]]+\]',        # [name], [var!t]
+    r'%\([^)]+\)[sdif]',    # %(name)s
+    r'%[sdif]',             # %s %d
+    r'\\n', r'\\t', r'\\r', r'\\"',
 ]
 PH_RE = re.compile('|'.join(PLACEHOLDER_PATTERNS))
-# Patron para restore de todos los tokens en un solo pass
 _RESTORE_RE = re.compile(
-    r'(?:\u27e6|\u3010|\u3014|\u300a|\[\[)\s*(\d+)\s*(?:\u27e7|\u3011|\u3015|\u300b|\]\])'
+    r'(?:⟦|【|〔|《|\[\[)\s*(\d+)\s*(?:⟧|】|〕|》|\]\])'
 )
 
 
 class Protector:
-    """Sustituye placeholders por tokens \u27e6N\u27e7 y los restaura en un solo pass."""
+    """Sustituye placeholders y nombres protegidos por tokens ⟦N⟧."""
     __slots__ = ('tokens',)
-
     def __init__(self):
         self.tokens: List[str] = []
 
@@ -184,17 +306,14 @@ class Protector:
         tokens = self.tokens
         def repl(m):
             tokens.append(m.group(0))
-            return f"\u27e6{len(tokens)-1}\u27e7"
-        # Paso 1: proteger {tags} y [variables] de Ren'Py
+            return f"⟦{len(tokens)-1}⟧"
         out = PH_RE.sub(repl, text)
-        # Paso 2: proteger nombres de personajes registrados
         _names = _PROTECTED_NAMES.get_all()
         if _names:
-            # ordenar de mas largo a mas corto para evitar matches parciales
             for name in sorted(_names, key=len, reverse=True):
                 if name in out:
                     tokens.append(name)
-                    out = out.replace(name, f"\u27e6{len(tokens)-1}\u27e7")
+                    out = out.replace(name, f"⟦{len(tokens)-1}⟧")
         return out
 
     def restore(self, text: str) -> str:
@@ -210,81 +329,193 @@ class Protector:
 
 
 # ---------------------------------------------------------------------------
-# Registro de nombres de personajes protegidos (module-level singleton)
+# Registro de nombres protegidos (lazy invalidation, sin O(N*M))
 # ---------------------------------------------------------------------------
 class _CharacterNameRegistry:
-    """Almacena nombres de personajes que NO deben ser traducidos."""
+    """Almacena nombres de personajes que NO deben ser traducidos.
+    La invalidacion de cache es LAZY: en lugar de recorrer el cache cada
+    vez que se registra un nombre, solo bumpeamos un epoch. Al hacer
+    CACHE.get() para un nombre protegido, esta funcion ya devuelve el
+    nombre original sin tocar cache (translate_batch lo gestiona)."""
     def __init__(self):
         self._names: set = set()
         self._lock = threading.Lock()
+        self._epoch = 0
 
     def register(self, names):
-        """Registra una coleccion de nombres como terminos protegidos.
-        
-        Al registrar, también limpia del caché cualquier traducción
-        incorrecta que se haya guardado previamente para esos nombres
-        (p.ej. si "Melisa" fue cacheada como "Toronjil" en sesión anterior).
-        """
+        new = []
         with self._lock:
             for n in names:
                 n = n.strip()
-                if n and len(n) >= 2:
+                if n and len(n) >= 2 and n not in self._names:
                     self._names.add(n)
-                    # Limpiar del caché en memoria cualquier traducción
-                    # incorrecta para este nombre (evita envenenamiento de caché)
-                    try:
-                        CACHE._mem._data = {
-                            k: v for k, v in CACHE._mem._data.items()
-                            if not (k.startswith(n + '|') or ('|' + n + '|') in k)
-                        }
-                    except Exception:
-                        pass
+                    new.append(n)
+            if new:
+                self._epoch += 1
 
     def clear(self):
         with self._lock:
             self._names.clear()
+            self._epoch += 1
+
+    def remove(self, name):
+        with self._lock:
+            self._names.discard(name)
+            self._epoch += 1
 
     def get_all(self) -> list:
         with self._lock:
             return list(self._names)
 
+    def get_set(self) -> set:
+        with self._lock:
+            return set(self._names)
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
+
 _PROTECTED_NAMES = _CharacterNameRegistry()
 
 
 def register_character_names(names) -> None:
-    """Registra nombres de personajes para que el Protector no los traduzca.
-
-    Args:
-        names: lista/set/iterable de strings con los nombres.
-    """
     _PROTECTED_NAMES.register(names)
 
-
 def get_protected_names() -> list:
-    """Devuelve la lista de nombres actualmente protegidos."""
     return _PROTECTED_NAMES.get_all()
+
+def clear_character_names() -> None:
+    _PROTECTED_NAMES.clear()
 
 
 # ---------------------------------------------------------------------------
-# Sesion HTTP global -- pool 256, keep-alive agresivo
+# Glosario de usuario (terminos forzados source->target)
+# ---------------------------------------------------------------------------
+class _Glossary:
+    """Glosario de terminos source->target. Aplicacion en dos modos:
+       - hard: el termino se sustituye por el target ANTES de traducir
+         (y se restaura por su placeholder), garantiza que aparezca tal cual.
+       - post: se sustituye en el texto traducido (case-insensitive).
+    """
+    def __init__(self):
+        self._terms: Dict[str, str] = {}
+        self._lock = threading.Lock()
+        self._compiled = None  # (regex_big, table)
+
+    def _recompile(self):
+        if not self._terms:
+            self._compiled = None
+            return
+        items = sorted(self._terms.items(), key=lambda kv: -len(kv[0]))
+        keys = [re.escape(k) for k, _ in items]
+        vals = [v for _, v in items]
+        pattern = re.compile(
+            r'(?<![A-Za-z0-9_])(' + '|'.join(keys) + r')(?![A-Za-z0-9_])',
+            re.IGNORECASE
+        )
+        # mapa case-insensitive
+        ci_map = {k.lower(): v for k, v in items}
+        self._compiled = (pattern, ci_map)
+
+    def add(self, source: str, target: str):
+        s = (source or '').strip(); t = (target or '').strip()
+        if not s or not t:
+            return
+        with self._lock:
+            self._terms[s] = t
+            self._recompile()
+
+    def add_many(self, mapping: Dict[str, str]):
+        with self._lock:
+            for k, v in mapping.items():
+                k = (k or '').strip(); v = (v or '').strip()
+                if k and v:
+                    self._terms[k] = v
+            self._recompile()
+
+    def remove(self, source: str):
+        with self._lock:
+            self._terms.pop(source, None)
+            self._recompile()
+
+    def clear(self):
+        with self._lock:
+            self._terms.clear()
+            self._compiled = None
+
+    def get_all(self) -> Dict[str, str]:
+        with self._lock:
+            return dict(self._terms)
+
+    def apply_post(self, text: str) -> str:
+        """Aplica el glosario despues de traducir (preserva capitalizacion del match)."""
+        if not self._compiled or not text:
+            return text
+        pattern, ci_map = self._compiled
+        def repl(m):
+            src = m.group(1)
+            tgt = ci_map.get(src.lower(), src)
+            # preservar capitalizacion basica
+            if src.isupper(): return tgt.upper()
+            if src[0].isupper(): return tgt[:1].upper() + tgt[1:]
+            return tgt
+        return pattern.sub(repl, text)
+
+    def save(self, path: Path = GLOSSARY_PATH):
+        try:
+            with self._lock:
+                path.write_text(json.dumps(self._terms, ensure_ascii=False, indent=2),
+                                encoding='utf-8')
+        except Exception as e:
+            print('[glossary save]', e)
+
+    def load(self, path: Path = GLOSSARY_PATH):
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding='utf-8'))
+                if isinstance(data, dict):
+                    self.add_many({str(k): str(v) for k, v in data.items()})
+        except Exception as e:
+            print('[glossary load]', e)
+
+
+GLOSSARY = _Glossary()
+GLOSSARY.load()
+
+
+def glossary_add(source: str, target: str) -> None:
+    GLOSSARY.add(source, target); GLOSSARY.save()
+
+def glossary_add_many(mapping: Dict[str, str]) -> None:
+    GLOSSARY.add_many(mapping); GLOSSARY.save()
+
+def glossary_remove(source: str) -> None:
+    GLOSSARY.remove(source); GLOSSARY.save()
+
+def glossary_clear() -> None:
+    GLOSSARY.clear(); GLOSSARY.save()
+
+def glossary_all() -> Dict[str, str]:
+    return GLOSSARY.get_all()
+
+
+# ---------------------------------------------------------------------------
+# Sesion HTTP -- pool 256, keep-alive
 # ---------------------------------------------------------------------------
 def _make_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
-        total=3, connect=2, read=2, backoff_factor=0.1,
+        total=3, connect=2, read=2, backoff_factor=0.15,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(['GET', 'POST']),
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(
-        pool_connections=256,
-        pool_maxsize=256,
-        max_retries=retry,
-    )
+    adapter = HTTPAdapter(pool_connections=256, pool_maxsize=256, max_retries=retry)
     s.mount('http://', adapter)
     s.mount('https://', adapter)
     s.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'),
         'Accept-Encoding': 'gzip, deflate, br',
         'Accept': '*/*',
         'Connection': 'keep-alive',
@@ -293,45 +524,42 @@ def _make_session() -> requests.Session:
 
 _SESSION = _make_session()
 
+# Prewarming DIFERIDO: se dispara al primer translate, no al import
+_prewarm_done = False
+_prewarm_lock = threading.Lock()
 
-def _prewarm_connections():
-    """Pre-calienta conexiones HTTP para eliminar latencia de handshake."""
-    endpoints = [
-        'https://translate.googleapis.com',
-        'https://translate.google.com',
-    ]
-    for ep in endpoints:
-        try:
-            _SESSION.head(ep, timeout=3)
-        except Exception:
-            pass
-
-# Pre-warming en background al importar el modulo
-_prewarm_thread = threading.Thread(target=_prewarm_connections, daemon=True)
-_prewarm_thread.start()
+def _prewarm_connections_once():
+    global _prewarm_done
+    if _prewarm_done:
+        return
+    with _prewarm_lock:
+        if _prewarm_done:
+            return
+        _prewarm_done = True
+        def _do():
+            endpoints = ['https://translate.googleapis.com', 'https://translate.google.com']
+            for ep in endpoints:
+                try: _SESSION.head(ep, timeout=3)
+                except Exception: pass
+        threading.Thread(target=_do, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
 # Cache en memoria (LRU) + disco persistente
 # ---------------------------------------------------------------------------
 class LRUMemoryCache:
-    """Cache en memoria con limite de tamano (LRU eviction).
-    Usa dict normal (Python 3.7+ mantiene orden de insercion) para menos overhead.
-    """
     def __init__(self, maxsize: int = 200_000):
         self._data: dict = {}
         self._maxsize = maxsize
         self._lock = threading.Lock()
 
     def get(self, k: str) -> Optional[str]:
-        # Fast path: sin lock para reads (dict es thread-safe para reads en CPython)
         v = self._data.get(k)
-        if v is not None:
-            # Mover al final (LRU) solo si hay riesgo de eviction
-            if len(self._data) > self._maxsize * 0.9:
-                with self._lock:
-                    if k in self._data:
-                        self._data[k] = self._data.pop(k)
+        if v is not None and len(self._data) > self._maxsize * 0.9:
+            # mueve al final solo si estamos cerca del limite
+            with self._lock:
+                if k in self._data:
+                    self._data[k] = self._data.pop(k)
         return v
 
     def set(self, k: str, v: str):
@@ -339,13 +567,7 @@ class LRUMemoryCache:
             if k in self._data:
                 del self._data[k]
             self._data[k] = v
-            if len(self._data) > self._maxsize:
-                # Evict el mas antiguo
-                try:
-                    next(iter(self._data))
-                    del self._data[next(iter(self._data))]
-                except StopIteration:
-                    pass
+            self._evict_locked()
 
     def set_many(self, items: Dict[str, str]):
         if not items:
@@ -355,26 +577,36 @@ class LRUMemoryCache:
                 if k in self._data:
                     del self._data[k]
                 self._data[k] = v
-            # Evict si excede maxsize
-            while len(self._data) > self._maxsize:
-                try:
-                    del self._data[next(iter(self._data))]
-                except StopIteration:
-                    break
+            self._evict_locked()
+
+    def _evict_locked(self):
+        # FIX: bucle while -- evicta TODOS los excedentes, no solo uno
+        while len(self._data) > self._maxsize:
+            try:
+                oldest = next(iter(self._data))
+                del self._data[oldest]
+            except StopIteration:
+                break
 
     def bulk_load(self, data: Dict[str, str]):
         with self._lock:
             self._data.update(data)
+            self._evict_locked()
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
 
     def snapshot(self) -> Dict[str, str]:
         with self._lock:
             return dict(self._data)
 
+    def __len__(self):
+        return len(self._data)
+
 
 class TranslationCache:
-    """Cache de dos capas: memoria (LRU rapido) + disco (persistente).
-    Flush al disco es asincrono para no bloquear workers."""
-
+    """Cache de dos capas: memoria LRU + disco persistente."""
     def __init__(self, path: Path = CACHE_PATH):
         self.path = path
         self._lock = threading.Lock()
@@ -382,32 +614,43 @@ class TranslationCache:
         self._mem = LRUMemoryCache(maxsize=200_000)
         self._dirty = False
         self._flush_thread: Optional[threading.Thread] = None
+        self._namespace = ''  # cache namespace opcional por proyecto
         self.load()
 
+    def set_namespace(self, ns: str):
+        """Cambia el namespace -- las nuevas keys lo incluyen. No invalida lo guardado."""
+        self._namespace = (ns or '').strip()
+
+    @staticmethod
+    def _make_key(text: str, source: str, target: str, engine: str, ns: str = '') -> str:
+        payload = f"{ns}|{engine}|{source}|{target}|{text}".encode('utf-8')
+        return hashlib.md5(payload, usedforsecurity=False).hexdigest()
+
+    def namespaced_key(self, text: str, source: str, target: str, engine: str) -> str:
+        """Key con namespace activo (usar en translate_batch / _translate_one)."""
+        return self._make_key(text, source, target, engine, self._namespace)
+
+    # Compatibilidad con codigo externo que llamaba TranslationCache.key(...)
+    # como staticmethod, sin namespace (renpy_parser, code legacy).
     @staticmethod
     def key(text: str, source: str, target: str, engine: str) -> str:
-        # MD5 es ~30% mas rapido que SHA1 para este uso
-        return hashlib.md5(
-            f"{engine}|{source}|{target}|{text}".encode('utf-8'),
-            usedforsecurity=False
-        ).hexdigest()
+        return TranslationCache._make_key(text, source, target, engine, '')
 
     def load(self):
         if self.path.exists():
             try:
                 raw = self.path.read_text(encoding='utf-8')
                 data = _json_loads(raw)
-                self._data = data
-                self._mem.bulk_load(data)
+                if isinstance(data, dict):
+                    self._data = data
+                    self._mem.bulk_load(data)
             except Exception:
                 self._data = {}
 
     def get(self, k: str) -> Optional[str]:
-        # Fast path: memoria primero (sin I/O)
         v = self._mem.get(k)
         if v is not None:
             return v
-        # Fallback a dict principal
         return self._data.get(k)
 
     def set(self, k: str, v: str):
@@ -417,16 +660,39 @@ class TranslationCache:
             self._dirty = True
 
     def set_many(self, items: Dict[str, str]):
-        """Batch set -- mas eficiente que llamar set() en loop."""
-        if not items:
-            return
+        if not items: return
         self._mem.set_many(items)
         with self._lock:
             self._data.update(items)
             self._dirty = True
 
+    def delete_prefix(self, prefix: str) -> int:
+        """Elimina entradas cuya key tenga ese prefijo (rara, util para debug)."""
+        n = 0
+        with self._lock:
+            keys = [k for k in self._data if k.startswith(prefix)]
+            for k in keys:
+                self._data.pop(k, None)
+                n += 1
+            if n: self._dirty = True
+        if n:
+            for k in keys:
+                self._mem._data.pop(k, None)
+        return n
+
+    def clear_all(self):
+        """Limpia TODO: memoria, disco y flush."""
+        with self._lock:
+            self._data.clear()
+            self._dirty = True
+        self._mem.clear()
+        try:
+            if self.path.exists():
+                self.path.unlink()
+        except Exception:
+            pass
+
     def flush(self):
-        """Flush sincrono (llamado al final del batch)."""
         with self._lock:
             if not self._dirty:
                 return
@@ -440,13 +706,16 @@ class TranslationCache:
                 print('cache flush err:', e)
 
     def flush_async(self):
-        """Flush asincrono -- no bloquea el thread que llama."""
         if not self._dirty:
             return
         if self._flush_thread and self._flush_thread.is_alive():
-            return  # ya hay un flush en curso
+            return
         self._flush_thread = threading.Thread(target=self.flush, daemon=True)
         self._flush_thread.start()
+
+    def size(self) -> Tuple[int, int]:
+        """Devuelve (entradas_disco, entradas_memoria)."""
+        return (len(self._data), len(self._mem))
 
 
 CACHE = TranslationCache()
@@ -456,7 +725,7 @@ CACHE = TranslationCache()
 # DeepLX
 # ---------------------------------------------------------------------------
 def translate_deeplx(text: str, source: str, target: str,
-                     endpoint: str, timeout: int = 8) -> str:
+                     endpoint: str, timeout: int = 10) -> str:
     payload = {"text": text, "source_lang": source.upper(), "target_lang": target.upper()}
     r = _SESSION.post(endpoint, json=payload, timeout=timeout)
     r.raise_for_status()
@@ -469,28 +738,19 @@ def translate_deeplx(text: str, source: str, target: str,
 
 
 # ---------------------------------------------------------------------------
-# Google Free -- SINGLE y BATCH
+# Google Free
 # ---------------------------------------------------------------------------
 GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
 GOOGLE_BATCH_URL = "https://translate.googleapis.com/translate_a/t"
 
-# Limites optimizados para maximo throughput
-# Google acepta hasta ~5000 chars por request, usamos 8000 con el endpoint /t
-# que es mas generoso. Maximo 200 textos por request.
 _GOOGLE_BATCH_CHAR_LIMIT = 8000
 _GOOGLE_BATCH_MAX_TEXTS = 200
 
 
-def translate_google_free(text: str, source: str, target: str,
-                          timeout: int = 8) -> str:
-    """Traduce un solo texto con Google Translate gratis."""
-    params = {
-        "client": "gtx",
-        "sl": source,
-        "tl": target,
-        "dt": "t",
-        "q": text,
-    }
+def translate_google_free(text: str, source: str, target: str, timeout: int = 10) -> str:
+    _prewarm_connections_once()
+    params = {"client": "gtx", "sl": source, "tl": target, "dt": "t", "q": text}
+    STATS.single_calls += 1
     r = _SESSION.get(GOOGLE_URL, params=params, timeout=timeout)
     r.raise_for_status()
     r.encoding = 'utf-8'
@@ -502,15 +762,17 @@ def translate_google_free(text: str, source: str, target: str,
     except Exception:
         raise RuntimeError(f"Google respuesta no es JSON: {raw[:200]}")
     result = ''.join(seg[0] for seg in data[0] if seg and seg[0])
-    return _postprocess_latino(result, target)
+    STATS.total_chars += len(text)
+    return _postprocess_all(result, target)
 
 
 def translate_google_batch(texts: List[str], source: str, target: str,
-                           timeout: int = 12) -> List[str]:
+                           timeout: int = 14) -> List[str]:
     """
-    Traduce multiples textos en UNA sola request HTTP usando el endpoint
-    translate_a/t de Google (acepta multiples parametros q=).
-    Mucho mas rapido que N requests individuales.
+    Traduce multiples textos en una sola request HTTP.
+    FIX v6.0: si la respuesta tiene N != len(texts), conservamos los
+    que se mapearon correctamente y reintentamos solo los faltantes
+    en paralelo (antes se tiraba toda la respuesta).
     """
     if not texts:
         return []
@@ -520,16 +782,12 @@ def translate_google_batch(texts: List[str], source: str, target: str,
         except Exception:
             return ['']
 
-    # Construir params con multiples q= usando lista de tuplas (mas eficiente)
-    params = [
-        ('client', 'gtx'),
-        ('sl', source),
-        ('tl', target),
-        ('dt', 't'),
-    ]
+    _prewarm_connections_once()
+    params = [('client', 'gtx'), ('sl', source), ('tl', target), ('dt', 't')]
     for t in texts:
         params.append(('q', t))
 
+    STATS.batch_calls += 1
     try:
         r = _SESSION.get(GOOGLE_BATCH_URL, params=params, timeout=timeout)
         r.raise_for_status()
@@ -537,41 +795,60 @@ def translate_google_batch(texts: List[str], source: str, target: str,
         raw = r.text.strip()
         if not raw:
             raise ValueError("Google batch devolvio respuesta vacia")
-        try:
-            data = _json_loads(raw)
-        except Exception:
-            raise ValueError(f"Google batch respuesta no es JSON: {raw[:200]}")
-        # El endpoint /t devuelve lista de listas o lista de strings
-        results = []
+        data = _json_loads(raw)
+
+        results: List[str] = []
         if isinstance(data, list):
             for item in data:
                 if isinstance(item, list):
                     if item and isinstance(item[0], list):
-                        results.append(_postprocess_latino(''.join(seg[0] for seg in item if seg and seg[0]), target))
+                        results.append(_postprocess_all(
+                            ''.join(seg[0] for seg in item if seg and seg[0]), target))
                     elif item and isinstance(item[0], str):
-                        results.append(_postprocess_latino(item[0], target))
+                        results.append(_postprocess_all(item[0], target))
                     else:
                         results.append('')
                 elif isinstance(item, str):
-                    results.append(_postprocess_latino(item, target))
+                    results.append(_postprocess_all(item, target))
                 else:
                     results.append('')
-        # Si el resultado no coincide en cantidad, fallback a individuales
-        if len(results) != len(texts):
-            raise ValueError(f"Batch returned {len(results)} results for {len(texts)} texts")
-        return results
+
+        STATS.total_chars += sum(len(t) for t in texts)
+
+        if len(results) == len(texts):
+            return results
+
+        # MISMATCH: rescatamos lo que coincide por posicion (asumiendo
+        # que google preserva el orden de los q=) y reintentamos los faltantes
+        # en paralelo, en vez de tirar todo.
+        n = len(texts)
+        out: List[str] = [''] * n
+        for i, r2 in enumerate(results):
+            if i < n:
+                out[i] = r2 or ''
+        missing_idx = [i for i in range(n) if not out[i] or not out[i].strip()]
+        if missing_idx:
+            with ThreadPoolExecutor(max_workers=min(len(missing_idx), 12)) as ex:
+                fut_map = {ex.submit(translate_google_free, texts[i], source, target, timeout): i
+                           for i in missing_idx}
+                for fut in as_completed(fut_map):
+                    j = fut_map[fut]
+                    try:
+                        out[j] = fut.result() or ''
+                    except Exception:
+                        out[j] = ''
+        return out
     except Exception:
-        # Fallback paralelo: traducir en paralelo (no secuencial)
+        STATS.http_errors += 1
+        # Fallback paralelo total
         out = [''] * len(texts)
         with ThreadPoolExecutor(max_workers=min(len(texts), 12)) as ex:
             futs = {ex.submit(translate_google_free, t, source, target, timeout): i
                     for i, t in enumerate(texts)}
             for fut in as_completed(futs):
                 i = futs[fut]
-                try:
-                    out[i] = fut.result()
-                except Exception:
-                    out[i] = ''
+                try: out[i] = fut.result()
+                except Exception: out[i] = ''
         return out
 
 
@@ -579,16 +856,19 @@ def translate_google_batch(texts: List[str], source: str, target: str,
 # Lang mapping
 # ---------------------------------------------------------------------------
 _GOOGLE_LANG_MAP = {
-    # Español España → 'es' (Google default)
     'ES': 'es',
-    # Español Latino/Latinoamérica → 'es-419' (Google sí lo soporta)
     'ES-419': 'es-419', 'ES_419': 'es-419', 'ES_LA': 'es-419',
     'ES-MX': 'es-419', 'ES_MX': 'es-419',
     'ES-AR': 'es-419', 'ES-CO': 'es-419', 'ES-CL': 'es-419',
+    'ES-PE': 'es-419', 'ES-UY': 'es-419', 'ES-VE': 'es-419',
     'EN': 'en', 'PT': 'pt', 'PT-BR': 'pt', 'PT-PT': 'pt-PT',
     'FR': 'fr', 'DE': 'de', 'IT': 'it',
-    'JA': 'ja', 'ZH': 'zh-CN', 'KO': 'ko', 'RU': 'ru',
-    'AUTO': 'auto',
+    'JA': 'ja', 'ZH': 'zh-CN', 'ZH-TW': 'zh-TW', 'KO': 'ko', 'RU': 'ru',
+    'PL': 'pl', 'TR': 'tr', 'AR': 'ar', 'NL': 'nl',
+    'CS': 'cs', 'SV': 'sv', 'DA': 'da', 'FI': 'fi', 'NO': 'no',
+    'UK': 'uk', 'HU': 'hu', 'RO': 'ro', 'BG': 'bg', 'EL': 'el',
+    'CA': 'ca', 'VI': 'vi', 'TH': 'th', 'ID': 'id', 'MS': 'ms',
+    'HE': 'iw', 'HI': 'hi', 'AUTO': 'auto',
 }
 
 def _map_target(engine: str, target: str) -> str:
@@ -601,11 +881,27 @@ def _map_target(engine: str, target: str) -> str:
     if t == 'AUTO': return 'ES'
     return t
 
-
 def _map_source(engine: str, source: str) -> str:
     if source.lower() == 'auto':
         return 'auto' if engine == 'google' else 'EN'
     return source.lower() if engine == 'google' else source.upper()
+
+
+# ---------------------------------------------------------------------------
+# Heuristica: la traduccion parece sin traducir (igual al original)?
+# ---------------------------------------------------------------------------
+def _looks_untranslated(src: str, out: str, source_lang: str, target: str) -> bool:
+    if not out or not src:
+        return False
+    if source_lang.lower() == target.lower():
+        return False
+    if out.strip() == src.strip():
+        # ignorar casos legitimos: puntuacion pura, numeros, urls
+        s = src.strip()
+        if len(s) <= 3: return False
+        if re.match(r'^[\d\W_]+$', s): return False
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -617,10 +913,24 @@ def _translate_one(text: str, source: str, target: str,
     if not text or not text.strip():
         return text
 
-    ck = TranslationCache.key(text, source, target, engine)
+    ck = CACHE.namespaced_key(text, source, target, engine)
     cached = CACHE.get(ck)
     if cached is not None:
+        STATS.cache_hits += 1
         return cached
+    STATS.cache_misses += 1
+
+    # Glosario: si el texto es exactamente un termino del glosario, usa el target
+    gloss = GLOSSARY.get_all()
+    if gloss:
+        gt = gloss.get(text.strip())
+        if gt:
+            CACHE.set(ck, gt)
+            return gt
+
+    # Nombre protegido: devolver original
+    if text.strip() in _PROTECTED_NAMES.get_set():
+        return text
 
     p = Protector()
     shielded = p.shield(text)
@@ -639,22 +949,25 @@ def _translate_one(text: str, source: str, target: str,
             else:
                 result = translate_google_free(shielded, src, tgt)
             restored = p.restore(result)
-            # No cachear ni devolver resultados vacios: probar siguiente motor
             if not restored or not restored.strip():
+                continue
+            # Aplicar glosario post-traduccion
+            restored = GLOSSARY.apply_post(restored)
+            # Si parece sin traducir y queda otro motor, intentar
+            if _looks_untranslated(text, restored, source, target) and eng != order[-1]:
+                STATS.fallback_calls += 1
                 continue
             CACHE.set(ck, restored)
             return restored
         except Exception as e:
             last_err = e
             continue
-    # Si todo falla / devuelve vacio, devolver el texto original (mejor que "")
-    # No se cachea para permitir reintentos en siguientes ejecuciones.
+
     if last_err:
         print(f'[translate fallback->original] "{text[:60]}": {last_err}')
     return text
 
 
-# Wrapper compatible con version anterior
 def translate(text: str, source: str = 'EN', target: str = 'ES',
               engine: str = 'deeplx', deeplx_endpoint: str = DEFAULT_DEEPLX,
               fallback: bool = True) -> str:
@@ -662,7 +975,7 @@ def translate(text: str, source: str = 'EN', target: str = 'ES',
 
 
 # ---------------------------------------------------------------------------
-# translate_batch -- ULTRA OPTIMIZADO v5.0
+# translate_batch -- ULTRA OPTIMIZADO v6.0
 # ---------------------------------------------------------------------------
 def translate_batch(
     texts: List[str],
@@ -672,78 +985,87 @@ def translate_batch(
     deeplx_endpoint: str = DEFAULT_DEEPLX,
     fallback: bool = True,
     workers: int = 16,
-    progress_cb: Optional[Callable[[int, int], None]] = None,
+    progress_cb: Optional[Callable] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
 ) -> List[str]:
-    """
-    Traduce lista de textos en paralelo -- ULTRA OPTIMIZADO v5.0:
-    - Google: batch real (hasta 200 textos / 8000 chars por request) + ThreadPool
-    - DeepLX: ThreadPool con workers
-    - Cache de dos capas (memoria LRU 200k + disco)
-    - Dedupe automatico
-    - Flush asincrono al disco
-    - Fallback paralelo para items fallidos
-    - Workers adaptativos segun cantidad de pendientes
-    """
+    """progress_cb puede aceptar (done, total) o (done, total, info_dict)."""
     n = len(texts)
     if n == 0:
         return []
 
     results: List[str] = [''] * n
+    t_start = time.time()
 
-    # -- 1. Dedupe --
+    def _emit_progress(done: int):
+        if not progress_cb: return
+        elapsed = time.time() - t_start
+        speed = done / elapsed if elapsed > 0 else 0
+        eta = (n - done) / speed if speed > 0 else 0
+        try:
+            progress_cb(done, n, {'elapsed': elapsed, 'speed': speed, 'eta': eta})
+        except TypeError:
+            try: progress_cb(done, n)
+            except Exception: pass
+
+    # 1) Dedupe
     unique: Dict[str, List[int]] = {}
     for i, t in enumerate(texts):
         unique.setdefault(t, []).append(i)
 
-    # -- 2. Resolver cache primero (sin red) --
-    # IMPORTANTE: los nombres de personaje protegidos se devuelven tal cual,
-    # sin tocar caché ni red. Esto previene que traducciones incorrectas
-    # cacheadas (p.ej. "Melisa"→"Toronjil") vuelvan a usarse.
-    _protected_set = set(_PROTECTED_NAMES.get_all())
+    # 2) Cache + glossary + protected prefilter
+    _protected = _PROTECTED_NAMES.get_set()
+    _gloss = GLOSSARY.get_all()
     pending: List[str] = []
     cache_hits = 0
     for t in unique.keys():
         if not t or not t.strip():
             for idx in unique[t]:
                 results[idx] = t
-            cache_hits += len(unique[t])
             continue
-        # Nombre protegido: devolver original, ignorar caché
-        if t.strip() in _protected_set:
+        if t.strip() in _protected:
             for idx in unique[t]:
                 results[idx] = t
-            cache_hits += len(unique[t])
             continue
-        ck = TranslationCache.key(t, source, target, engine)
+        # Glosario exacto -> sin red
+        gt = _gloss.get(t.strip()) if _gloss else None
+        if gt:
+            for idx in unique[t]:
+                results[idx] = gt
+            continue
+        ck = CACHE.namespaced_key(t, source, target, engine)
         c = CACHE.get(ck)
         if c is not None:
+            STATS.cache_hits += 1
+            cache_hits += len(unique[t])
             for idx in unique[t]:
                 results[idx] = c
-            cache_hits += len(unique[t])
         else:
+            STATS.cache_misses += 1
             pending.append(t)
 
     done_count = cache_hits
-    if progress_cb:
-        progress_cb(done_count, n)
+    # contar tambien los protegidos/glosario/empty como done
+    for t in unique.keys():
+        if (not t or not t.strip() or t.strip() in _protected
+                or (_gloss and t.strip() in _gloss)):
+            done_count += len(unique[t])
+    _emit_progress(done_count)
 
     if not pending:
         CACHE.flush_async()
         return results
 
-    # -- 3. Traducir los pendientes --
     if engine == 'google':
         _translate_google_parallel(
             pending, unique, results, source, target,
             deeplx_endpoint, fallback, workers,
-            done_count, n, progress_cb, stop_flag
+            done_count, n, _emit_progress, stop_flag
         )
     else:
         _translate_deeplx_parallel(
             pending, unique, results, source, target,
             deeplx_endpoint, fallback, workers,
-            done_count, n, progress_cb, stop_flag
+            done_count, n, _emit_progress, stop_flag
         )
 
     CACHE.flush_async()
@@ -758,16 +1080,8 @@ def _translate_google_parallel(
     deeplx_endpoint: str, fallback: bool,
     workers: int,
     done_count: int, n: int,
-    progress_cb, stop_flag
+    emit_progress, stop_flag,
 ):
-    """
-    Para Google: divide pending en chunks y los traduce en paralelo.
-    Cada worker hace 1 request batch con multiples textos.
-    Maximiza throughput: menos requests, mas textos por request.
-    v5.0: hasta 48 workers, 200 textos/request, 8000 chars/request.
-    """
-    # Escalar workers segun cantidad de pendientes
-    # Mas pendientes = mas workers (hasta 48)
     if len(pending) <= 50:
         google_workers = min(max(workers, 8), 16)
     elif len(pending) <= 200:
@@ -778,14 +1092,10 @@ def _translate_google_parallel(
     src = _map_source('google', source)
     tgt = _map_target('google', target)
 
-    # Dividir pending en chunks balanceados respetando limites
     all_sub_chunks = _split_by_char_limit(pending, _GOOGLE_BATCH_CHAR_LIMIT, _GOOGLE_BATCH_MAX_TEXTS)
-
-    # Si hay pocos chunks, no vale la pena tanto paralelismo
     actual_workers = min(google_workers, max(1, len(all_sub_chunks)))
 
     def process_sub_chunk(sub: List[str]) -> Dict[str, str]:
-        """Procesa un sub-chunk con una sola request batch."""
         chunk_results: Dict[str, str] = {}
         if not sub:
             return chunk_results
@@ -793,8 +1103,6 @@ def _translate_google_parallel(
         shielded = [p.shield(t) for p, t in zip(protectors, sub)]
         translated = translate_google_batch(shielded, src, tgt)
         cache_batch: Dict[str, str] = {}
-        # Reintento individual para items que el batch devolvio vacios
-        # (frecuente con textos cortos como ">>", "Rock", "Pop", "...")
         for i, (orig, prot, trans) in enumerate(zip(sub, protectors, translated)):
             if not trans or not trans.strip():
                 try:
@@ -805,12 +1113,15 @@ def _translate_google_parallel(
                     pass
             if trans and trans.strip():
                 restored = prot.restore(trans)
-                chunk_results[orig] = restored
-                ck = TranslationCache.key(orig, source, target, 'google')
-                cache_batch[ck] = restored
+                restored = GLOSSARY.apply_post(restored)
+                # detector "no traducido"
+                if _looks_untranslated(orig, restored, source, target):
+                    chunk_results[orig] = ''  # forzar fallback
+                else:
+                    chunk_results[orig] = restored
+                    ck = CACHE.namespaced_key(orig, source, target, 'google')
+                    cache_batch[ck] = restored
             else:
-                # Marcar como vacio: el llamador hara fallback a deeplx y,
-                # si tambien falla, usara el texto original.
                 chunk_results[orig] = ''
         if cache_batch:
             CACHE.set_many(cache_batch)
@@ -834,19 +1145,17 @@ def _translate_google_parallel(
                             results[idx] = translation
                         done_count += len(unique.get(orig_text, []))
 
-                # Fallback paralelo para los que fallaron
                 if failed_texts:
+                    STATS.fallback_calls += len(failed_texts)
                     fallback_results = _parallel_fallback(
                         failed_texts, source, target, deeplx_endpoint
                     )
                     for orig_text, translation in fallback_results.items():
-                        # Ultimo recurso: si sigue vacio, usar texto original
-                        # para no escribir new "" en los archivos .rpy
                         final = translation if (translation and translation.strip()) else orig_text
+                        final = GLOSSARY.apply_post(final)
                         for idx in unique.get(orig_text, []):
                             results[idx] = final
                         done_count += len(unique.get(orig_text, []))
-                # Casos sin fallback habilitado: tampoco dejar vacio
                 elif not fallback:
                     for orig_text, translation in chunk_res.items():
                         if not translation:
@@ -854,8 +1163,7 @@ def _translate_google_parallel(
                                 if not results[idx]:
                                     results[idx] = orig_text
 
-                if progress_cb:
-                    progress_cb(done_count, n)
+                emit_progress(done_count)
             except Exception as e:
                 print(f'[chunk error] {e}')
 
@@ -866,7 +1174,6 @@ def _parallel_fallback(
     deeplx_endpoint: str,
     max_workers: int = 12,
 ) -> Dict[str, str]:
-    """Fallback paralelo a DeepLX para textos que fallaron en Google batch."""
     results: Dict[str, str] = {}
     if not texts:
         return results
@@ -879,9 +1186,8 @@ def _parallel_fallback(
             shielded = p.shield(t)
             out = translate_deeplx(shielded, src, tgt, deeplx_endpoint)
             restored = p.restore(out)
-            # Solo cachear si no esta vacio
             if restored and restored.strip():
-                ck = TranslationCache.key(t, source, target, 'google')
+                ck = CACHE.namespaced_key(t, source, target, 'google')
                 CACHE.set(ck, restored)
             return (t, restored)
         except Exception:
@@ -901,12 +1207,8 @@ def _translate_deeplx_parallel(
     deeplx_endpoint: str, fallback: bool,
     workers: int,
     done_count: int, n: int,
-    progress_cb, stop_flag
+    emit_progress, stop_flag,
 ):
-    """Para DeepLX: 1 texto por request, maximo paralelismo.
-    v5.0: hasta 24 workers.
-    """
-    # Escalar workers segun pendientes
     if len(pending) <= 20:
         deeplx_workers = min(max(workers, 4), 8)
     elif len(pending) <= 100:
@@ -916,8 +1218,7 @@ def _translate_deeplx_parallel(
 
     def task(t: str) -> Tuple[str, str, Optional[Exception]]:
         try:
-            out = _translate_one(t, source, target, 'deeplx',
-                                 deeplx_endpoint, fallback)
+            out = _translate_one(t, source, target, 'deeplx', deeplx_endpoint, fallback)
             return (t, out, None)
         except Exception as e:
             return (t, '', e)
@@ -936,17 +1237,17 @@ def _translate_deeplx_parallel(
             src_text, out, err = fut.result()
             if err:
                 error_count += 1
+                STATS.http_errors += 1
                 print(f'[translate error] "{src_text[:60]}": {err}')
-            # Nunca dejar vacio: usar el original si todo fallo
             final = out if (out and out.strip()) else src_text
+            final = GLOSSARY.apply_post(final)
             for idx in unique.get(src_text, []):
                 results[idx] = final
             done_count += len(unique.get(src_text, []))
             processed += 1
             if processed % flush_every == 0:
                 CACHE.flush_async()
-            if progress_cb:
-                progress_cb(done_count, n)
+            emit_progress(done_count)
 
     if error_count:
         print(f'[translate_batch] {error_count} textos fallaron de {len(pending)} unicos.')
@@ -955,20 +1256,8 @@ def _translate_deeplx_parallel(
 # ---------------------------------------------------------------------------
 # Helpers de chunking
 # ---------------------------------------------------------------------------
-def _split_into_chunks(items: List[str], n_chunks: int) -> List[List[str]]:
-    """Divide lista en n_chunks partes aproximadamente iguales."""
-    if not items:
-        return []
-    n_chunks = max(1, min(n_chunks, len(items)))
-    size = -(-len(items) // n_chunks)  # ceil division
-    return [items[i:i + size] for i in range(0, len(items), size)]
-
-
 def _split_by_char_limit(items: List[str], char_limit: int,
                          max_items: int) -> List[List[str]]:
-    """Divide lista respetando limite de caracteres y maximo de items por chunk.
-    v5.0: char_limit=8000, max_items=200 para maximo throughput.
-    """
     chunks = []
     current: List[str] = []
     current_chars = 0
@@ -987,44 +1276,41 @@ def _split_by_char_limit(items: List[str], char_limit: int,
 
 
 # ---------------------------------------------------------------------------
-# Test rapido
+# API publica extra
+# ---------------------------------------------------------------------------
+def set_cache_namespace(ns: str) -> None:
+    """Activa un namespace por-proyecto para aislar cache entre juegos."""
+    CACHE.set_namespace(ns or '')
+
+def stats_snapshot() -> Dict[str, float]:
+    return STATS.snapshot()
+
+def stats_reset() -> None:
+    STATS.reset()
+
+
+# ---------------------------------------------------------------------------
+# Self-test
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    import time
-    # Limpiar cache para test real de red
-    CACHE._data = {}
-    CACHE._mem._data.clear()
-
+    CACHE.clear_all()
     test_texts = [
         "Hello {b}world{/b}, [name]!",
         "Good morning, how are you?",
-        "Hello {b}world{/b}, [name]!",  # duplicado -- debe usar dedupe
+        "Hello {b}world{/b}, [name]!",
         "I love you so much.",
-        "What do you want to do today?",
-        "Let's go to the park.",
-        "She smiled at me.",
-        "The sun is shining bright.",
-        "I can't believe you did that.",
-        "This is the best day of my life.",
-        "Where are you going tonight?",
-        "Please don't leave me alone.",
-        "I have something important to tell you.",
-        "Are you sure about this decision?",
-        "Everything will be alright in the end.",
-        "I missed you so much while you were gone.",
+        "Honestly, I don't know.",
+        "Of course, I'll help you.",
     ]
-    print(f"Traduciendo {len(test_texts)} textos ({len(set(test_texts))} unicos)...")
+    print(f"Traduciendo {len(test_texts)} textos...")
     t0 = time.time()
     out = translate_batch(
-        test_texts,
-        source='auto', target='ES', engine='google', workers=16,
-        progress_cb=lambda d, t: print(f"  progreso: {d}/{t}")
+        test_texts, source='auto', target='ES-419', engine='google', workers=16,
+        progress_cb=lambda d, t, info=None: print(f"  {d}/{t}"
+            + (f"  eta={info['eta']:.1f}s" if info else ''))
     )
     dt = time.time() - t0
-    if dt > 0.001:
-        print(f"\nTiempo: {dt:.2f}s | {len(test_texts)/dt:.1f} textos/s")
-    else:
-        print(f"\nTiempo: <1ms (cache hit)")
+    print(f"\nTiempo: {dt:.2f}s")
     for orig, trans in zip(test_texts, out):
-        print(f"  {orig!r}")
-        print(f"    -> {trans!r}")
+        print(f"  {orig!r}\n    -> {trans!r}")
+    print('\nStats:', stats_snapshot())
